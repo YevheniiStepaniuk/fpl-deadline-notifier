@@ -132,8 +132,20 @@ class Alert:
     offset_hours: int
 ```
 
-The key written to state is `{kind}:{gw}:{offset_hours}` — for example `waivers:2:24`. A key is
-written only after a successful send, and a key already present is never sent again.
+An alert's state identity is one key **per game** it covers:
+`{kind}:{gw}:{game}:{offset_hours}` — for example `waivers:2:draft:24`. A merged FPL+Draft deadline
+alert therefore carries two keys, and writes both when it is sent.
+
+Per game rather than one key per alert, because `merge` deliberately keeps the two games as separate
+moments whenever they publish different instants for the same gameweek. Under a single
+`{kind}:{gw}:{offset}` key those two moments would collide: whichever fired first would write the
+key, and the other would find it already there and never send — losing exactly the divergence the
+merge went to trouble to preserve. Per-game keys also make the reverse case safe, where the games
+diverge *after* a merged alert has gone out: both keys are already spent, so neither half re-fires.
+
+An alert is owed while **any** of its keys is unsent. Keys are written only after a successful
+send, and keyed by gameweek rather than by instant, so a deadline the Premier League moves by an
+hour is not mistaken for a new alert.
 
 ### What a normal gameweek actually looks like
 
@@ -288,6 +300,8 @@ Cases that must be covered:
 - Two alerts falling in one tick, after a moved deadline, render as one message.
 - A cold start two hours before a deadline sends only the two-hour alert, not both.
 - A superseded alert is retired, so it cannot fire later on its own.
+- Two games diverged on one gameweek keep separate keys, so both alerts still fire.
+- A merged alert writes both games' keys, so the pair does not re-fire on the next tick.
 - On an unmoved schedule, the four alerts for a gameweek fire at four distinct times.
 - An alert already in state is not resent.
 - A trigger whose moment has passed is suppressed and marked.
