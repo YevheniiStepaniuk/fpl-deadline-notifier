@@ -1,0 +1,8 @@
+{
+  "events": [
+    {"id": 1, "name": "Gameweek 1", "deadline_time": "2026-08-21T17:30:00Z", "finished": false},
+    {"id": 2, "name": "Gameweek 2", "deadline_time": "2026-08-28T17:30:00Z", "finished": false},
+    {"id": 3, "name": "Gameweek 3", "deadline_time": "2026-09-04T17:30:00Z", "finished": false},
+    {"id": 9, "name": "Gameweek 9", "deadline_time": "2026-10-31T11:00:00Z", "finished": false}
+  ]
+}
