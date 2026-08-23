@@ -1380,9 +1380,9 @@ MOMENT = Moment("deadline", 2, WHEN, frozenset({"fpl", "draft"}))
 
 def test_a_saved_state_round_trips(tmp_path):
     path = tmp_path / "state.json"
-    save_state(path, State(sent={"deadline:2:24"}, cached={"fpl": [MOMENT]}))
+    save_state(path, State(sent={"deadline:2:fpl:24"}, cached={"fpl": [MOMENT]}))
     restored = load_state(path)
-    assert restored.sent == {"deadline:2:24"}
+    assert restored.sent == {"deadline:2:fpl:24"}
     assert restored.cached == {"fpl": [MOMENT]}
 
 
@@ -1413,7 +1413,7 @@ def test_a_corrupt_file_loads_as_empty(tmp_path):
     """Half a JSON object, from a crash mid-write. Refusing to start here would mean a
     truncated file silently costs every future alert."""
     path = tmp_path / "state.json"
-    path.write_text('{"sent": ["deadline:2:24"')
+    path.write_text('{"sent": ["deadline:2:fpl:24"')
     state = load_state(path)
     assert state.sent == set()
 
@@ -1429,11 +1429,11 @@ def test_a_cached_entry_with_an_unreadable_moment_is_dropped_not_fatal(tmp_path)
     a schema change costs a refetch rather than a duplicate alert storm."""
     path = tmp_path / "state.json"
     path.write_text(json.dumps({
-        "sent": ["deadline:2:24"],
+        "sent": ["deadline:2:fpl:24"],
         "cached": {"fpl": [{"kind": "deadline"}], "draft": []},
     }))
     state = load_state(path)
-    assert state.sent == {"deadline:2:24"}
+    assert state.sent == {"deadline:2:fpl:24"}
     assert "fpl" not in state.cached
 
 
@@ -1463,9 +1463,9 @@ def test_overwriting_replaces_rather_than_merges(tmp_path):
 def test_the_file_is_human_readable(tmp_path):
     """It is the only window into why an alert did or did not fire."""
     path = tmp_path / "state.json"
-    save_state(path, State(sent={"deadline:2:24"}, cached={"fpl": [MOMENT]}))
+    save_state(path, State(sent={"deadline:2:fpl:24"}, cached={"fpl": [MOMENT]}))
     text = path.read_text()
-    assert "deadline:2:24" in text
+    assert "deadline:2:fpl:24" in text
     assert "\n" in text
 ```
 
@@ -1930,7 +1930,8 @@ def test_a_successful_send_is_persisted_so_the_next_tick_is_silent(tmp_path):
         run_once(cfg, client, state, now, refresh=True)
         run_once(cfg, client, state, now + datetime.timedelta(minutes=1), refresh=False)
     assert send.call_count == 1
-    assert "deadline:2:2" in load_state(cfg.state_path).sent
+    # Both games, because GW2's deadline is one merged moment covering the pair.
+    assert {"deadline:2:fpl:2", "deadline:2:draft:2"} <= load_state(cfg.state_path).sent
 
 
 @respx.mock
@@ -1951,10 +1952,10 @@ def test_a_failed_send_leaves_the_key_unwritten_so_the_next_tick_retries(tmp_pat
         run_once(cfg, client, state, now, refresh=True)
         # Not `== set()`: this tick also retires the superseded 24h alert and the whole
         # of GW1, and those are written. The point is that the *failed* key is not.
-        assert "deadline:2:2" not in load_state(cfg.state_path).sent
+        assert "deadline:2:fpl:2" not in load_state(cfg.state_path).sent
         run_once(cfg, client, state, now + datetime.timedelta(minutes=1), refresh=False)
     assert send.call_count == 4
-    assert "deadline:2:2" in load_state(cfg.state_path).sent
+    assert "deadline:2:fpl:2" in load_state(cfg.state_path).sent
 
 
 @respx.mock
@@ -2029,7 +2030,7 @@ def test_a_restart_after_a_long_outage_retires_stale_alerts_silently(tmp_path):
     with httpx.Client() as client:
         run_once(cfg, client, state, DEADLINE + datetime.timedelta(hours=1), refresh=True)
     assert send.call_count == 0
-    assert "deadline:2:2" in load_state(cfg.state_path).sent
+    assert "deadline:2:fpl:2" in load_state(cfg.state_path).sent
 
 
 def test_main_exits_nonzero_with_a_named_variable_when_config_is_missing(monkeypatch, capsys):
@@ -2120,10 +2121,10 @@ def run_once(
     to_send, to_retire = due_alerts(moments, state.sent, now)
 
     for alert in to_retire:
-        log.info("retiring %s: its moment has passed", alert.key)
-    # Retirements are recorded whether or not a send follows, so a restart after a long
-    # outage settles in one tick instead of re-evaluating every time.
-    state.sent.update(alert.key for alert in to_retire)
+        log.info("retiring %s", ", ".join(sorted(alert.keys)))
+        # Retirements are recorded whether or not a send follows, so a restart after a
+        # long outage settles in one tick instead of re-evaluating every time.
+        state.sent.update(alert.keys)
 
     if to_send:
         try:
@@ -2133,8 +2134,11 @@ def run_once(
             # until it succeeds or the moment passes and retirement takes over.
             log.error("send failed, will retry next tick: %s", exc)
         else:
-            log.info("sent %s", ", ".join(a.key for a in to_send))
-            state.sent.update(alert.key for alert in to_send)
+            log.info("sent %s", ", ".join(sorted(k for a in to_send for k in a.keys)))
+            # Every game the alert covered, so a later divergence between the two does
+            # not re-fire the half whose key was never written.
+            for alert in to_send:
+                state.sent.update(alert.keys)
 
     if to_send or to_retire or refresh:
         save_state(cfg.state_path, state)
@@ -2417,6 +2421,10 @@ No gaps.
 3. The most-urgent-wins rule was added to both spec and plan during the pre-flight scan, after
    working the numbers showed a cold start two hours before a deadline would send "GW2 deadline in
    24 hours" alongside the true one.
+4. `Alert` exposes `keys` (a `frozenset`, one per game) rather than a single `key`. Task 3's review
+   found that a single `{kind}:{gw}:{offset}` key collides across the two moments `merge`
+   deliberately keeps apart when FPL and Draft diverge on a gameweek, so whichever fired first
+   silenced the other. Spec and plan both updated.
 
 **Type consistency:** `Moment(kind, gw, when, games)` and `Alert(moment, offset_hours)` are constructed positionally in Tasks 3–7 exactly as defined in Tasks 2–3. `fetch_source(client, game)`, `merge(*groups)`, `due_alerts(moments, sent, now)`, `format_message(alerts, tz)`, `load_state(path)`, `save_state(path, state)`, `send_message(client, token, chat_id, text, sleep=...)` and `run_once(cfg, client, state, now, refresh)` are each called with the signature their producing task defines. `Config` field names match between `config.py` and every use in `__main__.py` and `test_main.py`.
 
