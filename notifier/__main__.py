@@ -35,6 +35,19 @@ log = logging.getLogger("notifier")
 GAMES = ("fpl", "draft")
 
 
+def _should_refresh(
+    last_refresh: datetime.datetime | None,
+    now: datetime.datetime,
+    refresh_seconds: float,
+) -> bool:
+    """Whether this tick refetches. Pure, so the cadence is testable without a loop.
+
+    Inline in `main` this was the one branch no test could reach, and a regression to
+    "every tick" would have gone unnoticed at 2880 requests a day instead of 48.
+    """
+    return last_refresh is None or (now - last_refresh).total_seconds() >= refresh_seconds
+
+
 def _refresh(client: httpx.Client, state: State) -> None:
     """Refetch each source, keeping the previous copy of anything that fails.
 
@@ -45,7 +58,14 @@ def _refresh(client: httpx.Client, state: State) -> None:
     for game in GAMES:
         try:
             state.cached[game] = sources.fetch_source(client, game)
-        except httpx.HTTPError as exc:
+        except Exception as exc:
+            # Deliberately broad. `fetch_source` documents httpx.HTTPError, but it also
+            # parses: a 200 maintenance page raises JSONDecodeError, a malformed
+            # deadline_time raises ValueError out of fromisoformat, a renamed field
+            # raises KeyError. None of those is an HTTPError, so a narrow clause here
+            # lets them past `run_once` and out of the `while True` in main -- and then
+            # an FPL outage takes down the Draft alert that has nothing to do with it,
+            # which is the exact coupling this function exists to prevent.
             held = len(state.cached.get(game, []))
             log.warning("refresh failed for %s (%s); holding %d cached moments", game, exc, held)
 
@@ -129,7 +149,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         last_refresh = None
         while True:
             now = datetime.datetime.now(datetime.UTC)
-            due = last_refresh is None or (now - last_refresh).total_seconds() >= cfg.refresh_seconds
+            due = _should_refresh(last_refresh, now, cfg.refresh_seconds)
             run_once(cfg, client, state, now, refresh=due)
             if due:
                 last_refresh = now

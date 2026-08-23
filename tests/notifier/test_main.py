@@ -1,4 +1,5 @@
 import datetime
+import functools
 import json
 import pathlib
 import zoneinfo
@@ -7,11 +8,11 @@ import httpx
 import pytest
 import respx
 
-from notifier.__main__ import main, run_once
+from notifier.__main__ import main, run_once, _should_refresh
 from notifier.config import Config
 from notifier.sources import DRAFT_URL, FPL_URL, Moment
 from notifier.state import State, load_state
-from notifier.telegram import api_url
+from notifier.telegram import api_url, send_message as real_send_message
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 TOKEN = "123:abc"
@@ -72,8 +73,14 @@ def test_a_successful_send_is_persisted_so_the_next_tick_is_silent(tmp_path):
 def test_a_failed_send_leaves_the_key_unwritten_so_the_next_tick_retries(tmp_path, monkeypatch):
     """The single most important behaviour here: a Telegram outage must postpone the
     alert, never consume it."""
-    # Without this the two real backoff sleeps cost the suite five seconds.
-    monkeypatch.setattr("notifier.telegram.time.sleep", lambda _: None)
+    # `send_message`'s `sleep=time.sleep` default is bound at def time, so patching
+    # `notifier.telegram.time.sleep` does not reach it -- the earlier attempt at this
+    # was a no-op and the test really did cost five seconds. Injecting the fake through
+    # a partial is what actually skips the backoff.
+    monkeypatch.setattr(
+        "notifier.__main__.send_message",
+        functools.partial(real_send_message, sleep=lambda _: None),
+    )
     _mock_apis()
     send = respx.post(SEND_URL).mock(side_effect=[
         httpx.Response(500), httpx.Response(500), httpx.Response(500),
@@ -182,6 +189,23 @@ def test_an_unwritable_state_file_does_not_kill_the_tick(tmp_path, monkeypatch):
         run_once(_cfg(tmp_path), client, State(sent=set(), cached={}),
                  DEADLINE - datetime.timedelta(hours=2), refresh=True)
     assert send.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "elapsed_seconds, expected",
+    [
+        (None, True),   # first tick of the process: nothing cached yet
+        (59, False),    # a minute in, on the default hourly cadence
+        (3600, True),   # exactly due -- >=, so this tick refetches
+        (7200, True),   # long overdue, e.g. after the machine slept
+    ],
+)
+def test_the_refresh_cadence(elapsed_seconds, expected):
+    """48 requests a day, not 2880. Inline in `main` this branch was unreachable by any
+    test, so a regression to refetching every tick would have passed the whole suite."""
+    now = DEADLINE
+    last = None if elapsed_seconds is None else now - datetime.timedelta(seconds=elapsed_seconds)
+    assert _should_refresh(last, now, 3600.0) is expected
 
 
 def test_main_exits_nonzero_with_a_named_variable_when_config_is_missing(monkeypatch, capsys):
