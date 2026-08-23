@@ -127,3 +127,22 @@ def test_an_ok_false_body_with_a_200_status_is_still_a_failure():
     respx.post(URL).mock(return_value=httpx.Response(200, json={"ok": False, "description": "nope"}))
     with httpx.Client() as client, pytest.raises(TelegramError):
         send_message(client, TOKEN, CHAT, "hello", sleep=lambda _: None)
+
+
+@respx.mock
+def test_a_200_with_a_body_that_is_not_json_is_a_failure_not_a_crash():
+    """A proxy or a captive portal answering 200 with HTML. response.json() raises
+    JSONDecodeError, a ValueError -- and the tick loop catches TelegramError and nothing
+    else, so anything else escaping here takes the service down rather than retrying."""
+    respx.post(URL).mock(return_value=httpx.Response(200, content=b"<html>gateway</html>"))
+    with httpx.Client() as client, pytest.raises(TelegramError):
+        send_message(client, TOKEN, CHAT, "hello", sleep=lambda _: None)
+
+
+@respx.mock
+def test_a_200_whose_json_is_not_an_object_is_a_failure():
+    """Valid JSON, wrong shape. `.get` on a list raises AttributeError, the same leak
+    as above by a different route."""
+    respx.post(URL).mock(return_value=httpx.Response(200, json=["not", "an", "object"]))
+    with httpx.Client() as client, pytest.raises(TelegramError):
+        send_message(client, TOKEN, CHAT, "hello", sleep=lambda _: None)
