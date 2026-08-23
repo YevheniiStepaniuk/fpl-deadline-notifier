@@ -825,7 +825,9 @@ def test_the_two_hour_alert_fires_exactly_on_its_trigger():
 
 
 def test_a_tick_a_second_before_the_trigger_sends_nothing():
-    to_send, _ = due_alerts([GW2_DEADLINE], set(), at(hours=-2, seconds=-1))
+    """The 24h key is seeded because it is genuinely owed by this point -- its trigger
+    passed yesterday. Without it this asserts the most-urgent rule, not the boundary."""
+    to_send, _ = due_alerts([GW2_DEADLINE], {"deadline:2:24"}, at(hours=-2, seconds=-1))
     assert to_send == []
 
 
@@ -856,7 +858,10 @@ def test_a_moved_deadline_can_put_two_alerts_in_one_tick():
 
 
 def test_an_already_sent_key_is_not_resent():
-    to_send, to_retire = due_alerts([GW2_DEADLINE], {"deadline:2:2"}, at(hours=-2))
+    """Both keys, because by two hours out both offsets are owed. Seeding only the 2h
+    one leaves the 24h one legitimately due and tests nothing about resending."""
+    sent = {"deadline:2:24", "deadline:2:2"}
+    to_send, to_retire = due_alerts([GW2_DEADLINE], sent, at(hours=-2))
     assert to_send == []
     assert to_retire == []
 
@@ -894,7 +899,9 @@ def test_the_rule_applies_per_moment_not_per_tick():
     now = WAIVERS - datetime.timedelta(minutes=30)
     other = Moment("deadline", 3, WAIVERS + datetime.timedelta(hours=1), frozenset({"fpl"}))
     to_send, _ = due_alerts([GW2_WAIVERS, other], set(), now)
-    assert sorted(keys(to_send)) == ["deadline:3:24", "waivers:2:2"]
+    # Both offsets are due for both moments here -- `other` sits an hour past the waiver
+    # moment, so its 2h trigger has also passed -- so each contributes its 2h alert.
+    assert sorted(keys(to_send)) == ["deadline:3:2", "waivers:2:2"]
 
 
 def test_a_late_alert_still_sends_while_its_moment_is_ahead():
@@ -927,7 +934,9 @@ def test_a_moment_exactly_now_is_retired_rather_than_sent():
     """Zero notice is not a warning."""
     to_send, to_retire = due_alerts([GW2_DEADLINE], set(), DEADLINE)
     assert to_send == []
-    assert keys(to_retire) == ["deadline:2:24"]
+    # Both, and in trigger order: the moment has passed, so nothing about it is worth
+    # sending and everything still outstanding for it is retired.
+    assert keys(to_retire) == ["deadline:2:24", "deadline:2:2"]
 
 
 def test_one_gameweek_passing_does_not_retire_the_next():
