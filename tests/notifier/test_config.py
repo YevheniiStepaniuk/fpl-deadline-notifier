@@ -80,7 +80,16 @@ def test_load_config_defaults_to_the_process_environment(monkeypatch):
 def test_config_reads_the_environment_when_called_not_when_imported(monkeypatch):
     """`app/config.py` reads os.environ at import, and tests/conftest.py carries a long
     comment about what that cost. The notifier must not repeat it: importing the module
-    with no environment set has to be harmless, and a later setenv has to be visible."""
+    with no environment set has to be harmless, and a later setenv has to be visible.
+
+    This reload is also what makes `notifier/__main__.py` import `notifier.config` as a
+    module instead of unpacking `ConfigError` and `load_config` with `from ... import`.
+    A reload rebinds every name in the reloaded module to new objects; a name copied out
+    beforehand keeps pointing at the old one, so `except ConfigError` built from such a
+    copy silently stops matching what `load_config` actually raises. It only shows up
+    when both test modules run in the same session, so any future module that needs to
+    catch `ConfigError` should resolve it through the module, not import it by name.
+    """
     import importlib
 
     import notifier.config
