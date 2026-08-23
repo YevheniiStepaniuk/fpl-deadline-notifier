@@ -1,6 +1,8 @@
 import datetime
 import json
 
+import pytest
+
 from notifier.sources import Moment
 from notifier.state import State, load_state, save_state
 
@@ -27,10 +29,17 @@ def test_a_restored_moment_keeps_its_utc_awareness(tmp_path):
 
 
 def test_a_restored_moment_keeps_games_as_a_frozenset(tmp_path):
-    """JSON has no set type, so this survives a list round trip only if it is rebuilt."""
+    """JSON has no set type, so this survives a list round trip only if it is rebuilt.
+
+    isinstance, not just equality: a plain `set` compares equal to a `frozenset` with
+    the same contents, so an equality check alone would not notice `Moment` losing its
+    hashability -- and `Moment` goes into sets during the merge.
+    """
     path = tmp_path / "state.json"
     save_state(path, State(sent=set(), cached={"fpl": [MOMENT]}))
-    assert load_state(path).cached["fpl"][0].games == frozenset({"fpl", "draft"})
+    restored = load_state(path).cached["fpl"][0]
+    assert isinstance(restored.games, frozenset)
+    assert restored.games == frozenset({"fpl", "draft"})
 
 
 def test_a_missing_file_loads_as_empty(tmp_path):
@@ -52,6 +61,30 @@ def test_a_file_of_the_wrong_shape_loads_as_empty(tmp_path):
     path = tmp_path / "state.json"
     path.write_text('["not", "an", "object"]')
     assert load_state(path).sent == set()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"sent": 5, "cached": {}}',
+        '{"sent": [], "cached": ["not", "a", "dict"]}',
+        '{"sent": {"a": 1}, "cached": null}',
+        '{"sent": ["ok", 7], "cached": {"fpl": "not a list"}}',
+    ],
+)
+def test_a_wrong_shaped_field_degrades_instead_of_raising(tmp_path, payload):
+    """Valid JSON, wrong shape -- a hand edit, or the residue of a schema change.
+
+    The obvious `set(raw.get("sent") or [])` raises TypeError on the first of these and
+    AttributeError on the second, which breaks the module's own contract that every
+    read path degrades to empty. An always-on service that refuses to start has turned
+    a recoverable file into a missed deadline.
+    """
+    path = tmp_path / "state.json"
+    path.write_text(payload)
+    state = load_state(path)  # must not raise
+    assert isinstance(state.sent, set)
+    assert isinstance(state.cached, dict)
 
 
 def test_a_cached_entry_with_an_unreadable_moment_is_dropped_not_fatal(tmp_path):

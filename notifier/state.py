@@ -51,15 +51,30 @@ def load_state(path: pathlib.Path) -> State:
     if not isinstance(raw, dict):
         return State(sent=set(), cached={})
 
-    sent = set(raw.get("sent") or [])
+    # Each field is shape-checked rather than trusted. A file that is valid JSON but
+    # the wrong shape -- a hand edit, or the residue of a future schema change -- would
+    # otherwise raise from inside set() or .items(), and raising is the one thing this
+    # loader must not do: refusing to start over a file it could simply ignore is how a
+    # deadline gets missed.
+    raw_sent = raw.get("sent")
+    sent = (
+        {key for key in raw_sent if isinstance(key, str)}
+        if isinstance(raw_sent, list)
+        else set()
+    )
+
+    raw_cached = raw.get("cached")
     cached: dict[str, list[Moment]] = {}
-    for game, entries in (raw.get("cached") or {}).items():
-        try:
-            cached[game] = [_moment_from_json(entry) for entry in entries]
-        except (KeyError, TypeError, ValueError):
-            # Drop this source's cache only. The other source and the sent keys are
-            # still good, so a schema change costs a refetch, not a duplicate storm.
-            continue
+    if isinstance(raw_cached, dict):
+        for game, entries in raw_cached.items():
+            if not isinstance(entries, list):
+                continue
+            try:
+                cached[game] = [_moment_from_json(entry) for entry in entries]
+            except (KeyError, TypeError, ValueError):
+                # Drop this source's cache only. The other source and the sent keys are
+                # still good, so a schema change costs a refetch, not a duplicate storm.
+                continue
     return State(sent=sent, cached=cached)
 
 
