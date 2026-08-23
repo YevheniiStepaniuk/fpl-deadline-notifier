@@ -1878,7 +1878,7 @@ def send_message(
 - [ ] **Step 4: Run the telegram tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/notifier/test_telegram.py -v`
-Expected: PASS, 12 tests.
+Expected: PASS, 11 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -2276,7 +2276,7 @@ Expected: PASS, 12 tests.
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/pytest -q`
-Expected: every existing test still passes (484 at the branch point), plus 104 new ones.
+Expected: every existing test still passes (484 at the branch point), plus 103 new ones — 587 in total.
 
 - [ ] **Step 6: Commit**
 
