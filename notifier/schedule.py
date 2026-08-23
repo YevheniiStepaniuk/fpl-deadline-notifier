@@ -21,13 +21,24 @@ class Alert:
     offset_hours: int
 
     @property
-    def key(self) -> str:
-        """Identity in the sent-state file.
+    def keys(self) -> frozenset[str]:
+        """Identity in the sent-state file: one key per game this alert covers.
+
+        Per game rather than one key per alert, because `sources.merge` keeps FPL and
+        Draft as separate moments whenever they publish different instants for the same
+        gameweek. Under a single `{kind}:{gw}:{offset}` key those two moments would
+        collide -- whichever fired first would write the key and the other would find it
+        already there and never send, losing exactly the divergence merge preserves.
+        Per-game keys also make the reverse safe: if the games diverge after a merged
+        alert has gone out, both keys are already spent and neither half re-fires.
 
         Keyed by gameweek rather than by timestamp, so a deadline the Premier League
         moves by an hour does not read as a new alert and get sent twice.
         """
-        return f"{self.moment.kind}:{self.moment.gw}:{self.offset_hours}"
+        return frozenset(
+            f"{self.moment.kind}:{self.moment.gw}:{game}:{self.offset_hours}"
+            for game in self.moment.games
+        )
 
     @property
     def trigger(self) -> datetime.datetime:
@@ -47,7 +58,9 @@ def due_alerts(
     Between them they are what stops a restart after a long outage from delivering a
     burst of warnings that are either stale or wrong about the time remaining.
     """
-    if now.tzinfo is None:
+    # utcoffset() rather than tzinfo, which is also non-None for the pathological
+    # tzinfo whose utcoffset() returns None -- still naive for comparison purposes.
+    if now.utcoffset() is None:
         raise TypeError("due_alerts needs a timezone-aware `now`; got a naive datetime")
 
     to_send: list[Alert] = []
@@ -56,7 +69,9 @@ def due_alerts(
         due = [
             alert
             for alert in (Alert(moment, offset) for offset in OFFSETS_HOURS)
-            if alert.key not in sent and alert.trigger <= now
+            # Owed while *any* game's key is unsent: half-spent is not spent, and an
+            # FPL alert having gone out must not silence Draft's.
+            if any(key not in sent for key in alert.keys) and alert.trigger <= now
         ]
         if not due:
             continue
@@ -73,5 +88,5 @@ def due_alerts(
         urgent = min(due, key=lambda alert: alert.offset_hours)
         to_send.append(urgent)
         to_retire.extend(alert for alert in due if alert is not urgent)
-    key = lambda alert: (alert.trigger, alert.key)  # noqa: E731
-    return sorted(to_send, key=key), sorted(to_retire, key=key)
+    order = lambda alert: (alert.trigger, sorted(alert.keys))  # noqa: E731
+    return sorted(to_send, key=order), sorted(to_retire, key=order)
