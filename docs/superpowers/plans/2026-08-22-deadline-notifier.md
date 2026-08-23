@@ -168,7 +168,15 @@ def test_load_config_defaults_to_the_process_environment(monkeypatch):
 def test_config_reads_the_environment_when_called_not_when_imported(monkeypatch):
     """`app/config.py` reads os.environ at import, and tests/conftest.py carries a long
     comment about what that cost. The notifier must not repeat it: importing the module
-    with no environment set has to be harmless, and a later setenv has to be visible."""
+    with no environment set has to be harmless, and a later setenv has to be visible.
+
+    The reload here leaks: it rebinds every name in notifier.config to a new object,
+    including the ConfigError class, for the rest of the session. Any module that took
+    a copy with `from notifier.config import ConfigError` is then holding a class that
+    no longer matches what load_config raises. notifier/__main__.py imports the module
+    and resolves through it for exactly this reason -- keep it that way, and do the same
+    in anything else that needs to catch ConfigError.
+    """
     import importlib
 
     import notifier.config
@@ -1940,9 +1948,11 @@ and treating it as delivered would write the sent key and swallow the alert."
 - Create: `tests/notifier/test_main.py`
 
 **Interfaces:**
-- Consumes: everything from Tasks 1–6.
+- Consumes: everything from Tasks 1–6. Note that `notifier.config` is imported **as a
+  module** and its names resolved at call time — see the comment in the code below; a
+  `from notifier.config import ConfigError` breaks under the reload in Task 1's tests.
 - Produces:
-  - `notifier.__main__.run_once(cfg: Config, client: httpx.Client, state: State, now: datetime, refresh: bool) -> None` — mutates and saves `state`.
+  - `notifier.__main__.run_once(cfg: config.Config, client: httpx.Client, state: State, now: datetime, refresh: bool) -> None` — mutates and saves `state`.
   - `notifier.__main__.main(argv: Sequence[str] | None = None) -> int`
 
 - [ ] **Step 1: Write the failing loop tests**
@@ -2182,8 +2192,15 @@ from collections.abc import Sequence
 
 import httpx
 
-from notifier import sources
-from notifier.config import Config, ConfigError, load_config
+# `config` is imported as a module, not unpacked with `from ... import`, and the
+# difference is load-bearing. tests/notifier/test_config.py reloads notifier.config to
+# prove the module reads the environment when called rather than at import. A reload
+# rebinds every name in that module to *new* objects, including the ConfigError class --
+# so a copy of ConfigError taken at import time stops matching the exception
+# load_config actually raises, and `except ConfigError` silently stops catching. It
+# fails only when both test modules run together, which is the worst way to find out.
+# Resolving through the module object looks the name up at call time instead.
+from notifier import config, sources
 from notifier.render import format_message
 from notifier.schedule import due_alerts
 from notifier.state import State, load_state, save_state
@@ -2210,7 +2227,7 @@ def _refresh(client: httpx.Client, state: State) -> None:
 
 
 def run_once(
-    cfg: Config,
+    cfg: config.Config,
     client: httpx.Client,
     state: State,
     now: datetime.datetime,
@@ -2265,8 +2282,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     try:
-        cfg = load_config()
-    except ConfigError as exc:
+        cfg = config.load_config()
+    except config.ConfigError as exc:
         # Loud and named. A notifier that starts and silently never sends is worse than
         # one that refuses to start.
         print(f"notifier: {exc}", file=sys.stderr)
