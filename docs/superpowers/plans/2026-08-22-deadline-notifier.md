@@ -1651,6 +1651,8 @@ would mean guessing which game contributed what."
 Create `tests/notifier/test_telegram.py`:
 
 ```python
+import json
+
 import httpx
 import pytest
 import respx
@@ -1674,7 +1676,10 @@ def test_a_successful_send_posts_the_chat_id_and_text():
     with httpx.Client() as client:
         send_message(client, TOKEN, CHAT, "hello", sleep=lambda _: None)
     assert route.call_count == 1
-    assert route.calls[0].request.read() == b'{"chat_id": "987", "text": "hello"}'
+    # Parsed, not compared as raw bytes: httpx serialises `json=` with compact
+    # separators, so a byte-for-byte literal pins httpx's formatting rather than the
+    # payload this test is about.
+    assert json.loads(route.calls[0].request.read()) == {"chat_id": "987", "text": "hello"}
 
 
 def test_the_token_is_in_the_url_path_not_a_query_string():
