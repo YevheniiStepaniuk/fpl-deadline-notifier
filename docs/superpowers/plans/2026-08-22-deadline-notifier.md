@@ -170,12 +170,13 @@ def test_config_reads_the_environment_when_called_not_when_imported(monkeypatch)
     comment about what that cost. The notifier must not repeat it: importing the module
     with no environment set has to be harmless, and a later setenv has to be visible.
 
-    The reload here leaks: it rebinds every name in notifier.config to a new object,
-    including the ConfigError class, for the rest of the session. Any module that took
-    a copy with `from notifier.config import ConfigError` is then holding a class that
-    no longer matches what load_config raises. notifier/__main__.py imports the module
-    and resolves through it for exactly this reason -- keep it that way, and do the same
-    in anything else that needs to catch ConfigError.
+    This reload is also what makes `notifier/__main__.py` import `notifier.config` as a
+    module instead of unpacking `ConfigError` and `load_config` with `from ... import`.
+    A reload rebinds every name in the reloaded module to new objects; a name copied out
+    beforehand keeps pointing at the old one, so `except ConfigError` built from such a
+    copy silently stops matching what `load_config` actually raises. It only shows up
+    when both test modules run in the same session, so any future module that needs to
+    catch `ConfigError` should resolve it through the module, not import it by name.
     """
     import importlib
 
@@ -1961,6 +1962,7 @@ Create `tests/notifier/test_main.py`:
 
 ```python
 import datetime
+import functools
 import json
 import pathlib
 import zoneinfo
@@ -1969,11 +1971,11 @@ import httpx
 import pytest
 import respx
 
-from notifier.__main__ import main, run_once
+from notifier.__main__ import main, run_once, _should_refresh
 from notifier.config import Config
 from notifier.sources import DRAFT_URL, FPL_URL, Moment
 from notifier.state import State, load_state
-from notifier.telegram import api_url
+from notifier.telegram import api_url, send_message as real_send_message
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 TOKEN = "123:abc"
@@ -2034,8 +2036,14 @@ def test_a_successful_send_is_persisted_so_the_next_tick_is_silent(tmp_path):
 def test_a_failed_send_leaves_the_key_unwritten_so_the_next_tick_retries(tmp_path, monkeypatch):
     """The single most important behaviour here: a Telegram outage must postpone the
     alert, never consume it."""
-    # Without this the two real backoff sleeps cost the suite five seconds.
-    monkeypatch.setattr("notifier.telegram.time.sleep", lambda _: None)
+    # `send_message`'s `sleep=time.sleep` default is bound at def time, so patching
+    # `notifier.telegram.time.sleep` does not reach it -- the earlier attempt at this
+    # was a no-op and the test really did cost five seconds. Injecting the fake through
+    # a partial is what actually skips the backoff.
+    monkeypatch.setattr(
+        "notifier.__main__.send_message",
+        functools.partial(real_send_message, sleep=lambda _: None),
+    )
     _mock_apis()
     send = respx.post(SEND_URL).mock(side_effect=[
         httpx.Response(500), httpx.Response(500), httpx.Response(500),
@@ -2146,6 +2154,23 @@ def test_an_unwritable_state_file_does_not_kill_the_tick(tmp_path, monkeypatch):
     assert send.call_count == 1
 
 
+@pytest.mark.parametrize(
+    "elapsed_seconds, expected",
+    [
+        (None, True),   # first tick of the process: nothing cached yet
+        (59, False),    # a minute in, on the default hourly cadence
+        (3600, True),   # exactly due -- >=, so this tick refetches
+        (7200, True),   # long overdue, e.g. after the machine slept
+    ],
+)
+def test_the_refresh_cadence(elapsed_seconds, expected):
+    """48 requests a day, not 2880. Inline in `main` this branch was unreachable by any
+    test, so a regression to refetching every tick would have passed the whole suite."""
+    now = DEADLINE
+    last = None if elapsed_seconds is None else now - datetime.timedelta(seconds=elapsed_seconds)
+    assert _should_refresh(last, now, 3600.0) is expected
+
+
 def test_main_exits_nonzero_with_a_named_variable_when_config_is_missing(monkeypatch, capsys):
     """A notifier that starts and never sends is worse than one that refuses to start."""
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
@@ -2211,6 +2236,19 @@ log = logging.getLogger("notifier")
 GAMES = ("fpl", "draft")
 
 
+def _should_refresh(
+    last_refresh: datetime.datetime | None,
+    now: datetime.datetime,
+    refresh_seconds: float,
+) -> bool:
+    """Whether this tick refetches. Pure, so the cadence is testable without a loop.
+
+    Inline in `main` this was the one branch no test could reach, and a regression to
+    "every tick" would have gone unnoticed at 2880 requests a day instead of 48.
+    """
+    return last_refresh is None or (now - last_refresh).total_seconds() >= refresh_seconds
+
+
 def _refresh(client: httpx.Client, state: State) -> None:
     """Refetch each source, keeping the previous copy of anything that fails.
 
@@ -2221,7 +2259,14 @@ def _refresh(client: httpx.Client, state: State) -> None:
     for game in GAMES:
         try:
             state.cached[game] = sources.fetch_source(client, game)
-        except httpx.HTTPError as exc:
+        except Exception as exc:
+            # Deliberately broad. `fetch_source` documents httpx.HTTPError, but it also
+            # parses: a 200 maintenance page raises JSONDecodeError, a malformed
+            # deadline_time raises ValueError out of fromisoformat, a renamed field
+            # raises KeyError. None of those is an HTTPError, so a narrow clause here
+            # lets them past `run_once` and out of the `while True` in main -- and then
+            # an FPL outage takes down the Draft alert that has nothing to do with it,
+            # which is the exact coupling this function exists to prevent.
             held = len(state.cached.get(game, []))
             log.warning("refresh failed for %s (%s); holding %d cached moments", game, exc, held)
 
@@ -2305,7 +2350,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         last_refresh = None
         while True:
             now = datetime.datetime.now(datetime.UTC)
-            due = last_refresh is None or (now - last_refresh).total_seconds() >= cfg.refresh_seconds
+            due = _should_refresh(last_refresh, now, cfg.refresh_seconds)
             run_once(cfg, client, state, now, refresh=due)
             if due:
                 last_refresh = now
@@ -2321,12 +2366,12 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the loop tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/notifier/test_main.py -v`
-Expected: PASS, 12 tests.
+Expected: PASS, 16 tests (the cadence test is parametrized four ways).
 
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/pytest -q`
-Expected: every existing test still passes (484 at the branch point), plus 105 new ones — 589 in total.
+Expected: every existing test still passes (484 at the branch point), plus 109 new ones — 593 in total.
 
 - [ ] **Step 6: Commit**
 
