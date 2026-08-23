@@ -1371,6 +1371,8 @@ Create `tests/notifier/test_state.py`:
 import datetime
 import json
 
+import pytest
+
 from notifier.sources import Moment
 from notifier.state import State, load_state, save_state
 
@@ -1397,10 +1399,17 @@ def test_a_restored_moment_keeps_its_utc_awareness(tmp_path):
 
 
 def test_a_restored_moment_keeps_games_as_a_frozenset(tmp_path):
-    """JSON has no set type, so this survives a list round trip only if it is rebuilt."""
+    """JSON has no set type, so this survives a list round trip only if it is rebuilt.
+
+    isinstance, not just equality: a plain `set` compares equal to a `frozenset` with
+    the same contents, so an equality check alone would not notice `Moment` losing its
+    hashability -- and `Moment` goes into sets during the merge.
+    """
     path = tmp_path / "state.json"
     save_state(path, State(sent=set(), cached={"fpl": [MOMENT]}))
-    assert load_state(path).cached["fpl"][0].games == frozenset({"fpl", "draft"})
+    restored = load_state(path).cached["fpl"][0]
+    assert isinstance(restored.games, frozenset)
+    assert restored.games == frozenset({"fpl", "draft"})
 
 
 def test_a_missing_file_loads_as_empty(tmp_path):
@@ -1422,6 +1431,30 @@ def test_a_file_of_the_wrong_shape_loads_as_empty(tmp_path):
     path = tmp_path / "state.json"
     path.write_text('["not", "an", "object"]')
     assert load_state(path).sent == set()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"sent": 5, "cached": {}}',
+        '{"sent": [], "cached": ["not", "a", "dict"]}',
+        '{"sent": {"a": 1}, "cached": null}',
+        '{"sent": ["ok", 7], "cached": {"fpl": "not a list"}}',
+    ],
+)
+def test_a_wrong_shaped_field_degrades_instead_of_raising(tmp_path, payload):
+    """Valid JSON, wrong shape -- a hand edit, or the residue of a schema change.
+
+    The obvious `set(raw.get("sent") or [])` raises TypeError on the first of these and
+    AttributeError on the second, which breaks the module's own contract that every
+    read path degrades to empty. An always-on service that refuses to start has turned
+    a recoverable file into a missed deadline.
+    """
+    path = tmp_path / "state.json"
+    path.write_text(payload)
+    state = load_state(path)  # must not raise
+    assert isinstance(state.sent, set)
+    assert isinstance(state.cached, dict)
 
 
 def test_a_cached_entry_with_an_unreadable_moment_is_dropped_not_fatal(tmp_path):
@@ -1530,15 +1563,30 @@ def load_state(path: pathlib.Path) -> State:
     if not isinstance(raw, dict):
         return State(sent=set(), cached={})
 
-    sent = set(raw.get("sent") or [])
+    # Each field is shape-checked rather than trusted. A file that is valid JSON but
+    # the wrong shape -- a hand edit, or the residue of a future schema change -- would
+    # otherwise raise from inside set() or .items(), and raising is the one thing this
+    # loader must not do: refusing to start over a file it could simply ignore is how a
+    # deadline gets missed.
+    raw_sent = raw.get("sent")
+    sent = (
+        {key for key in raw_sent if isinstance(key, str)}
+        if isinstance(raw_sent, list)
+        else set()
+    )
+
+    raw_cached = raw.get("cached")
     cached: dict[str, list[Moment]] = {}
-    for game, entries in (raw.get("cached") or {}).items():
-        try:
-            cached[game] = [_moment_from_json(entry) for entry in entries]
-        except (KeyError, TypeError, ValueError):
-            # Drop this source's cache only. The other source and the sent keys are
-            # still good, so a schema change costs a refetch, not a duplicate storm.
-            continue
+    if isinstance(raw_cached, dict):
+        for game, entries in raw_cached.items():
+            if not isinstance(entries, list):
+                continue
+            try:
+                cached[game] = [_moment_from_json(entry) for entry in entries]
+            except (KeyError, TypeError, ValueError):
+                # Drop this source's cache only. The other source and the sent keys are
+                # still good, so a schema change costs a refetch, not a duplicate storm.
+                continue
     return State(sent=sent, cached=cached)
 
 
@@ -1562,7 +1610,7 @@ def save_state(path: pathlib.Path, state: State) -> None:
 - [ ] **Step 4: Run the state tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/notifier/test_state.py -v`
-Expected: PASS, 11 tests.
+Expected: PASS, 15 tests (the shape test is parametrized four ways).
 
 - [ ] **Step 5: Commit**
 
@@ -2033,6 +2081,23 @@ def test_a_restart_after_a_long_outage_retires_stale_alerts_silently(tmp_path):
     assert "deadline:2:fpl:2" in load_state(cfg.state_path).sent
 
 
+@respx.mock
+def test_an_unwritable_state_file_does_not_kill_the_tick(tmp_path, monkeypatch):
+    """A full disk or a permission change on data/ must not take down an always-on
+    service. By the time the write happens the alert has already been delivered."""
+    _mock_apis()
+    send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+
+    def boom(*args, **kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr("notifier.__main__.save_state", boom)
+    with httpx.Client() as client:
+        run_once(_cfg(tmp_path), client, State(sent=set(), cached={}),
+                 DEADLINE - datetime.timedelta(hours=2), refresh=True)
+    assert send.call_count == 1
+
+
 def test_main_exits_nonzero_with_a_named_variable_when_config_is_missing(monkeypatch, capsys):
     """A notifier that starts and never sends is worse than one that refuses to start."""
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
@@ -2141,7 +2206,13 @@ def run_once(
                 state.sent.update(alert.keys)
 
     if to_send or to_retire or refresh:
-        save_state(cfg.state_path, state)
+        try:
+            save_state(cfg.state_path, state)
+        except OSError as exc:
+            # A full disk or a permission change on data/ must not take down a service
+            # whose whole job is to still be running next Friday. The in-memory state
+            # is still correct, so nothing is lost until the process restarts.
+            log.error("could not write %s: %s", cfg.state_path, exc)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2195,12 +2266,12 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the loop tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/notifier/test_main.py -v`
-Expected: PASS, 11 tests.
+Expected: PASS, 12 tests.
 
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/pytest -q`
-Expected: every existing test still passes (484 at the branch point), plus 84 new ones.
+Expected: every existing test still passes (484 at the branch point), plus 104 new ones.
 
 - [ ] **Step 6: Commit**
 
@@ -2406,6 +2477,7 @@ reads like a wrong chat id rather than a missing handshake."
 | Rendering, timezone, `games` line | 4 |
 | Per-source cache in one state file | 5 |
 | Corrupt state degrades to empty | 5 |
+| Unwritable state does not kill the loop | 7 |
 | Telegram retries and backoff | 6 |
 | Tick loop, hourly refresh | 7 |
 | Failure table, all seven rows | 2, 5, 6, 7 |
