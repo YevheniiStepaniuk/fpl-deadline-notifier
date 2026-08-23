@@ -167,6 +167,21 @@ each. On an ordinary week that list has exactly one element. This is a defensive
 common one, and it is cheap: the alternative is a special case that only ever runs on the week
 something has already gone unusual.
 
+### Rule: only the most urgent alert for a moment is sent
+
+Both offsets for one moment can come due in the same tick — on a first run, or on a restart after
+an outage longer than 22 hours. The 24-hour trigger passed while the process was down, its moment
+is still ahead, so the late-send rule below would fire it. Sent as written, it says "GW2 deadline
+in 24 hours" about a deadline two hours away.
+
+So when several offsets for the same moment are due at once, the smallest is sent and the larger
+ones are retired. A message is then never wrong about how much time is left, which is the one thing
+this service exists to be right about.
+
+This does not touch a genuinely late alert that arrives alone. Down for three hours across the
+24-hour trigger, back up with 21 hours to spare, and the 24-hour alert still goes — "in 24 hours"
+is approximately true and the information is still useful. Only a *superseded* alert is dropped.
+
 ### Rule: a trigger whose moment has passed is suppressed
 
 If the process is down when a trigger time passes, the alert is sent on restart **only if the
@@ -271,6 +286,8 @@ Cases that must be covered:
 - Classic and Draft deadlines at different instants stay two moments.
 - Draft's `events.data` shape parses; classic's `events` list shape parses.
 - Two alerts falling in one tick, after a moved deadline, render as one message.
+- A cold start two hours before a deadline sends only the two-hour alert, not both.
+- A superseded alert is retired, so it cannot fire later on its own.
 - On an unmoved schedule, the four alerts for a gameweek fire at four distinct times.
 - An alert already in state is not resent.
 - A trigger whose moment has passed is suppressed and marked.

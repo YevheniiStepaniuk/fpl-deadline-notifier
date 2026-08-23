@@ -18,6 +18,9 @@
 - **All datetimes are timezone-aware.** UTC internally, converted to the display timezone only inside `render.py`. A naive `datetime` anywhere is a bug.
 - **Python 3.13**, run everything through `.venv/bin/`. Never `pip install`; the venv is already provisioned.
 - **Alert offsets are exactly `(24, 2)` hours.** Defined once, in `notifier/schedule.py`.
+- **Only the most urgent due alert for a moment is sent.** When both offsets for one moment come
+  due in the same tick, the smallest is sent and the larger ones are retired. See the spec's
+  "only the most urgent alert for a moment is sent".
 - **Moment kinds are exactly `"deadline"` and `"waivers"`.** `trades_time` is out of scope.
 - **Game names are exactly `"fpl"` and `"draft"`.**
 - **The sent-key format is `{kind}:{gw}:{offset_hours}`**, e.g. `waivers:2:24`.
@@ -841,10 +844,15 @@ def test_the_deadline_day_alert_fires_when_the_waiver_window_shuts():
 
 
 def test_a_moved_deadline_can_put_two_alerts_in_one_tick():
-    """FPL reschedules deadlines. This is the case the list-taking renderer exists for."""
+    """FPL reschedules deadlines. This is the case the list-taking renderer exists for.
+
+    Two *different* moments, so the most-urgent rule does not collapse them: it works
+    per moment, not per tick.
+    """
     moved = Moment("deadline", 3, WAIVERS + datetime.timedelta(hours=2), frozenset({"fpl"}))
-    to_send, _ = due_alerts([GW2_WAIVERS, moved], set(), at(hours=-24))
-    assert sorted(keys(to_send)) == ["deadline:3:2", "waivers:2:2"]
+    now = WAIVERS - datetime.timedelta(minutes=30)
+    to_send, _ = due_alerts([GW2_WAIVERS, moved], set(), now)
+    assert sorted(keys(to_send)) == ["deadline:3:24", "waivers:2:2"]
 
 
 def test_an_already_sent_key_is_not_resent():
@@ -857,6 +865,36 @@ def test_both_offsets_of_one_moment_are_independent():
     """Sending the 24h alert must not suppress the 2h one."""
     to_send, _ = due_alerts([GW2_DEADLINE], {"deadline:2:24"}, at(hours=-2))
     assert keys(to_send) == ["deadline:2:2"]
+
+
+def test_a_cold_start_two_hours_out_sends_only_the_two_hour_alert():
+    """First run with an empty state, two hours before the deadline. Both offsets are
+    due -- the 24h trigger passed yesterday and the moment is still ahead -- but
+    announcing "in 24 hours" about a deadline two hours away is the one thing this
+    service must never do."""
+    to_send, to_retire = due_alerts([GW2_DEADLINE], set(), at(hours=-2))
+    assert keys(to_send) == ["deadline:2:2"]
+    assert keys(to_retire) == ["deadline:2:24"]
+
+
+def test_a_superseded_alert_is_retired_so_it_cannot_fire_later():
+    """Retiring rather than merely skipping. Left unmarked, the 24h alert would still
+    be due on the next tick and every tick after it."""
+    _, to_retire = due_alerts([GW2_DEADLINE], set(), at(hours=-2))
+    again_send, again_retire = due_alerts(
+        [GW2_DEADLINE], {a.key for a in to_retire} | {"deadline:2:2"}, at(hours=-1)
+    )
+    assert again_send == []
+    assert again_retire == []
+
+
+def test_the_rule_applies_per_moment_not_per_tick():
+    """Two moments each with both offsets due. One alert survives from each, not one
+    overall -- a waiver window and a deadline are different things to be late for."""
+    now = WAIVERS - datetime.timedelta(minutes=30)
+    other = Moment("deadline", 3, WAIVERS + datetime.timedelta(hours=1), frozenset({"fpl"}))
+    to_send, _ = due_alerts([GW2_WAIVERS, other], set(), now)
+    assert sorted(keys(to_send)) == ["deadline:3:24", "waivers:2:2"]
 
 
 def test_a_late_alert_still_sends_while_its_moment_is_ahead():
@@ -900,8 +938,10 @@ def test_one_gameweek_passing_does_not_retire_the_next():
 
 
 def test_results_are_sorted_by_trigger_time():
-    moved = Moment("deadline", 3, WAIVERS + datetime.timedelta(minutes=30), frozenset({"fpl"}))
-    to_send, _ = due_alerts([GW2_WAIVERS, moved], set(), at(hours=-23))
+    moved = Moment("deadline", 3, WAIVERS + datetime.timedelta(hours=2), frozenset({"fpl"}))
+    now = WAIVERS - datetime.timedelta(minutes=30)
+    to_send, _ = due_alerts([GW2_WAIVERS, moved], set(), now)
+    assert len(to_send) == 2  # or the ordering assertion below proves nothing
     assert [a.trigger for a in to_send] == sorted(a.trigger for a in to_send)
 
 
@@ -968,8 +1008,10 @@ def due_alerts(
     """Split the alerts whose trigger has passed into those worth sending and those not.
 
     Returns (to_send, to_retire). Both need writing to state on success; only the first
-    needs a message. Retiring is what stops a restart after a long outage from
-    delivering a burst of warnings about deadlines that have already gone.
+    needs a message. Two things get retired rather than sent: an alert whose moment has
+    already passed, and an alert superseded by a more urgent one for the same moment.
+    Between them they are what stops a restart after a long outage from delivering a
+    burst of warnings that are either stale or wrong about the time remaining.
     """
     if now.tzinfo is None:
         raise TypeError("due_alerts needs a timezone-aware `now`; got a naive datetime")
@@ -977,16 +1019,26 @@ def due_alerts(
     to_send: list[Alert] = []
     to_retire: list[Alert] = []
     for moment in moments:
-        for offset in OFFSETS_HOURS:
-            alert = Alert(moment, offset)
-            if alert.key in sent or alert.trigger > now:
-                continue
-            # `>=` rather than `>`: a moment landing exactly on this tick offers zero
-            # notice, which is not a warning.
-            if moment.when <= now:
-                to_retire.append(alert)
-            else:
-                to_send.append(alert)
+        due = [
+            alert
+            for alert in (Alert(moment, offset) for offset in OFFSETS_HOURS)
+            if alert.key not in sent and alert.trigger <= now
+        ]
+        if not due:
+            continue
+        # `<=` rather than `<`: a moment landing exactly on this tick offers zero
+        # notice, which is not a warning.
+        if moment.when <= now:
+            to_retire.extend(due)
+            continue
+        # Both offsets come due together on a first run, or on a restart after an
+        # outage longer than 22 hours. Sending both would announce "in 24 hours" about
+        # a deadline two hours away. The smallest offset is the only one still true, so
+        # the rest are retired -- retired rather than skipped, or they would be due
+        # again on every tick from here to the deadline.
+        urgent = min(due, key=lambda alert: alert.offset_hours)
+        to_send.append(urgent)
+        to_retire.extend(alert for alert in due if alert is not urgent)
     key = lambda alert: (alert.trigger, alert.key)  # noqa: E731
     return sorted(to_send, key=key), sorted(to_retire, key=key)
 ```
@@ -994,7 +1046,7 @@ def due_alerts(
 - [ ] **Step 4: Run the schedule tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/notifier/test_schedule.py -v`
-Expected: PASS, 19 tests.
+Expected: PASS, 22 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -1002,14 +1054,17 @@ Expected: PASS, 19 tests.
 git add notifier/schedule.py tests/notifier/test_schedule.py
 git commit -m "feat(notifier): decide which alerts are owed
 
-due_alerts takes `now` as an argument, so the boundaries are testable at an
-exact instant rather than approximately. The trigger comparison is >=: with a
-60s poll, a strict > would be right 59 ticks out of 60 and look correct in
+due_alerts takes \`now\` as an argument, so the boundaries are testable at an
+exact instant rather than approximately. The trigger comparison is <=: with a
+60s poll, a strict < would be right 59 ticks out of 60 and look correct in
 every hand test.
 
-Alerts split into send and retire. Retiring is what stops a restart after a
-long outage from delivering a burst of warnings about deadlines already gone --
-the caller writes both sets to state, but only sends the first.
+Alerts split into send and retire, and two things get retired. One is an alert
+whose moment has already passed, which stops a restart after a long outage from
+delivering a burst of warnings about deadlines already gone. The other is an
+alert superseded by a more urgent one for the same moment: on a first run two
+hours before a deadline both offsets come due at once, and sending both would
+announce 'in 24 hours' about a deadline two hours away.
 
 Keys are per gameweek, not per timestamp, so a rescheduled deadline is not
 mistaken for a new alert."
@@ -1804,9 +1859,11 @@ def test_a_successful_send_is_persisted_so_the_next_tick_is_silent(tmp_path):
 
 
 @respx.mock
-def test_a_failed_send_leaves_the_key_unwritten_so_the_next_tick_retries(tmp_path):
+def test_a_failed_send_leaves_the_key_unwritten_so_the_next_tick_retries(tmp_path, monkeypatch):
     """The single most important behaviour here: a Telegram outage must postpone the
     alert, never consume it."""
+    # Without this the two real backoff sleeps cost the suite five seconds.
+    monkeypatch.setattr("notifier.telegram.time.sleep", lambda _: None)
     _mock_apis()
     send = respx.post(SEND_URL).mock(side_effect=[
         httpx.Response(500), httpx.Response(500), httpx.Response(500),
@@ -1817,7 +1874,9 @@ def test_a_failed_send_leaves_the_key_unwritten_so_the_next_tick_retries(tmp_pat
     now = DEADLINE - datetime.timedelta(hours=2)
     with httpx.Client() as client:
         run_once(cfg, client, state, now, refresh=True)
-        assert load_state(cfg.state_path).sent == set()
+        # Not `== set()`: this tick also retires the superseded 24h alert and the whole
+        # of GW1, and those are written. The point is that the *failed* key is not.
+        assert "deadline:2:2" not in load_state(cfg.state_path).sent
         run_once(cfg, client, state, now + datetime.timedelta(minutes=1), refresh=False)
     assert send.call_count == 4
     assert "deadline:2:2" in load_state(cfg.state_path).sent
@@ -1866,8 +1925,11 @@ def test_one_source_failing_still_sends_the_other_from_cache(tmp_path):
     state = State(sent=set(), cached={"draft": [Moment("waivers", 2, DEADLINE, frozenset({"draft"}))]})
     with httpx.Client() as client:
         run_once(_cfg(tmp_path), client, state, DEADLINE - datetime.timedelta(hours=2), refresh=True)
-    body = json.loads(send.calls[0].request.read())
-    assert "FPL + Draft" in body["text"] or "waiver" in body["text"]
+    text = json.loads(send.calls[0].request.read())["text"]
+    # Both halves, asserted separately. An `or` here would pass on either one and hide
+    # exactly the failure this test exists to catch.
+    assert "GW2 deadline in 2 hours\nFPL · " in text
+    assert "GW2 waiver window closes in 2 hours\nDraft · " in text
     assert state.cached["draft"]  # the stale half survived the failed refresh
 
 
@@ -2059,7 +2121,7 @@ Expected: PASS, 11 tests.
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/pytest -q`
-Expected: every existing test still passes, plus 81 new ones.
+Expected: every existing test still passes (484 at the branch point), plus 84 new ones.
 
 - [ ] **Step 6: Commit**
 
@@ -2261,6 +2323,7 @@ reads like a wrong chat id rather than a missing handshake."
 | Merging sources on exact equality | 2 |
 | `Alert`, offsets, key format | 3 |
 | Same-tick merge, stale suppression | 3 (rules) + 4 (rendering) |
+| Most-urgent-wins rule | 3 |
 | Rendering, timezone, `games` line | 4 |
 | Per-source cache in one state file | 5 |
 | Corrupt state degrades to empty | 5 |
@@ -2272,10 +2335,13 @@ reads like a wrong chat id rather than a missing handshake."
 
 No gaps.
 
-**Deviations from the spec, both deliberate:**
+**Deviations from the spec, all deliberate:**
 
 1. `render.py` is a module of its own rather than part of `schedule.py`. Formatting is pure and separable, and the scheduling rules read better without copy in the middle. The spec's architecture listing has been updated to match.
 2. `--once` is a flag on `main`. The spec does not mention it; it is what makes the deploy smoke test in Task 8 and the wiring test in Task 7 possible without a loop that never returns.
+3. The most-urgent-wins rule was added to both spec and plan during the pre-flight scan, after
+   working the numbers showed a cold start two hours before a deadline would send "GW2 deadline in
+   24 hours" alongside the true one.
 
 **Type consistency:** `Moment(kind, gw, when, games)` and `Alert(moment, offset_hours)` are constructed positionally in Tasks 3–7 exactly as defined in Tasks 2–3. `fetch_source(client, game)`, `merge(*groups)`, `due_alerts(moments, sent, now)`, `format_message(alerts, tz)`, `load_state(path)`, `save_state(path, state)`, `send_message(client, token, chat_id, text, sleep=...)` and `run_once(cfg, client, state, now, refresh)` are each called with the signature their producing task defines. `Config` field names match between `config.py` and every use in `__main__.py` and `test_main.py`.
 
