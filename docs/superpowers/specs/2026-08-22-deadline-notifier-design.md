@@ -54,14 +54,16 @@ notifier/
   __main__.py      entrypoint: the tick loop, signal handling, wiring
   config.py        environment: token, chat id, timezone, intervals, paths
   sources.py       both APIs -> list[Moment]
-  schedule.py      (moments, sent_keys, now) -> list[Alert]      PURE
-  state.py         one JSON file: sent keys + the last-good moments cache
+  schedule.py      (moments, sent_keys, now) -> alerts to send, alerts to retire   PURE
+  render.py        list[Alert] + tz -> the message text                             PURE
+  state.py         one JSON file: sent keys + the last-good per-source moments
   telegram.py      sendMessage over httpx, with retries
 ```
 
 | Piece | Purity | Tested with |
 |---|---|---|
 | `schedule.py` | pure | plain values, an injected `now` |
+| `render.py` | pure | plain values, a fixed timezone |
 | `sources.py` | network in, values out | `respx` against captured payloads |
 | `telegram.py` | network out | `respx` |
 | `state.py` | filesystem | `tmp_path` |
@@ -111,9 +113,13 @@ without a special branch.
 Draft waivers produce their own moment, since `waivers_time` is a different instant and belongs to
 Draft alone.
 
-The merged list is written to the state file after every successful refresh, and read back at
-startup. One file holds both the sent keys and this cache, because they are written on the same
-schedule and a half-restored pair would be worse than either alone.
+Each source's moments are written to the state file separately after a successful fetch, and read
+back at startup. Per-source rather than merged, because the fallback below has to use a fresh half
+alongside a cached half, and splitting a merged list back apart means guessing which game
+contributed what. Merging happens on read, every tick, from whichever halves are current.
+
+One file holds both the sent keys and this cache: they are written on the same schedule, and a
+half-restored pair would be worse than either alone.
 
 ## Alerts
 
@@ -129,15 +135,37 @@ class Alert:
 The key written to state is `{kind}:{gw}:{offset_hours}` — for example `waivers:2:24`. A key is
 written only after a successful send, and a key already present is never sent again.
 
-### Rule: alerts due in the same tick merge into one message
+### What a normal gameweek actually looks like
 
 Draft's `waivers_before_deadline_hours` is `24`, confirmed in the live `settings.transactions`
 payload, and the GW2 numbers bear it out: waivers `2026-08-27T17:30:00Z`, deadline
 `2026-08-28T17:30:00Z`.
 
-So the 24-hour warning for a gameweek deadline fires at the exact instant the waiver window shuts.
-Sent as two messages, that is a pair of notifications a second apart saying overlapping things.
-Every alert due in one tick is therefore rendered as a single message with one line per alert.
+Given a waiver moment always sits 24 hours before its deadline moment, the four alert times per
+gameweek land at `D-48h`, `D-26h`, `D-24h` and `D-2h` — four distinct instants. For GW2, in London
+time:
+
+| When | Message |
+|---|---|
+| Wed 26 Aug, 18:30 | GW2 waiver window closes in 24 hours |
+| Thu 27 Aug, 16:30 | GW2 waiver window closes in 2 hours |
+| Thu 27 Aug, 18:30 | GW2 deadline in 24 hours |
+| Fri 28 Aug, 16:30 | GW2 deadline in 2 hours |
+
+Four pings a gameweek, none of them redundant. Note the third: the 24-hour deadline warning fires
+at the exact instant the waiver window shuts, which is the schedule doing its job rather than a
+collision to resolve.
+
+### Rule: alerts due in the same tick merge into one message
+
+The table above holds only while the published schedule holds. FPL reschedules deadlines — for
+international breaks, for postponements, for TV. A moved deadline can put two alerts in the same
+minute, and sending them as separate messages would mean two notifications a second apart.
+
+So the renderer takes a list of alerts, not one alert, and emits a single message with one line
+each. On an ordinary week that list has exactly one element. This is a defensive path, not the
+common one, and it is cheap: the alternative is a special case that only ever runs on the week
+something has already gone unusual.
 
 ### Rule: a trigger whose moment has passed is suppressed
 
@@ -160,12 +188,12 @@ Single alert:
 FPL + Draft · Fri 28 Aug, 18:30 BST
 ```
 
-Two alerts in one tick:
+Two alerts in one tick, which happens only when a deadline has been moved:
 
 ```
-⏰ Two deadlines
+⏰ Two reminders
 
-GW2 waiver window closes now
+GW2 waiver window closes in 2 hours
 Draft · Thu 27 Aug, 18:30 BST
 
 GW2 deadline in 24 hours
@@ -242,7 +270,8 @@ Cases that must be covered:
 - Classic and Draft deadlines at the same instant merge to one moment with both games.
 - Classic and Draft deadlines at different instants stay two moments.
 - Draft's `events.data` shape parses; classic's `events` list shape parses.
-- A waiver deadline and a gameweek 24-hour warning falling in one tick render as one message.
+- Two alerts falling in one tick, after a moved deadline, render as one message.
+- On an unmoved schedule, the four alerts for a gameweek fire at four distinct times.
 - An alert already in state is not resent.
 - A trigger whose moment has passed is suppressed and marked.
 - A trigger whose moment is still ahead is sent late after a restart.
