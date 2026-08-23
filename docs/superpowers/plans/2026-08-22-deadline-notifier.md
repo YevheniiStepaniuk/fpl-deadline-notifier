@@ -1780,6 +1780,25 @@ def test_an_ok_false_body_with_a_200_status_is_still_a_failure():
     respx.post(URL).mock(return_value=httpx.Response(200, json={"ok": False, "description": "nope"}))
     with httpx.Client() as client, pytest.raises(TelegramError):
         send_message(client, TOKEN, CHAT, "hello", sleep=lambda _: None)
+
+
+@respx.mock
+def test_a_200_with_a_body_that_is_not_json_is_a_failure_not_a_crash():
+    """A proxy or a captive portal answering 200 with HTML. response.json() raises
+    JSONDecodeError, a ValueError -- and the tick loop catches TelegramError and nothing
+    else, so anything else escaping here takes the service down rather than retrying."""
+    respx.post(URL).mock(return_value=httpx.Response(200, content=b"<html>gateway</html>"))
+    with httpx.Client() as client, pytest.raises(TelegramError):
+        send_message(client, TOKEN, CHAT, "hello", sleep=lambda _: None)
+
+
+@respx.mock
+def test_a_200_whose_json_is_not_an_object_is_a_failure():
+    """Valid JSON, wrong shape. `.get` on a list raises AttributeError, the same leak
+    as above by a different route."""
+    respx.post(URL).mock(return_value=httpx.Response(200, json=["not", "an", "object"]))
+    with httpx.Client() as client, pytest.raises(TelegramError):
+        send_message(client, TOKEN, CHAT, "hello", sleep=lambda _: None)
 ```
 
 - [ ] **Step 2: Run the telegram tests to verify they fail**
@@ -1850,8 +1869,11 @@ def send_message(
                 json={"chat_id": chat_id, "text": text},
                 timeout=TIMEOUT,
             )
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
             # The likeliest real failure on a home server is the network, not Telegram.
+            # InvalidURL is named separately because it subclasses Exception rather than
+            # HTTPError, so a token with a stray space in it would otherwise escape as
+            # something the caller does not catch.
             last = f"{type(exc).__name__}: {exc}"
         else:
             if response.status_code in _PERMANENT:
@@ -1860,12 +1882,23 @@ def send_message(
                     f"{_describe(response)}"
                 )
             if response.status_code == 200:
-                body = response.json()
-                if body.get("ok"):
-                    return
-                # Telegram has answered 200 with ok:false. Treating that as delivered
-                # would write the sent key and swallow the alert for good.
-                last = f"200 but ok=false: {_describe(response)}"
+                try:
+                    body = response.json()
+                except ValueError:
+                    # A proxy or a captive portal answering 200 with HTML. Symmetric
+                    # with _describe: a body we cannot read is a failed send, not an
+                    # exception. Anything escaping this function that is not a
+                    # TelegramError takes down the tick loop, because that is the only
+                    # thing the caller catches.
+                    last = f"200 with a body that is not JSON: {response.text[:200]!r}"
+                else:
+                    # isinstance before .get: valid JSON that is not an object would
+                    # raise AttributeError, the same leak by another route.
+                    if isinstance(body, dict) and body.get("ok"):
+                        return
+                    # Telegram has answered 200 with ok:false. Treating that as
+                    # delivered would write the sent key and swallow the alert for good.
+                    last = f"200 without a success body: {_describe(response)}"
             else:
                 last = f"HTTP {response.status_code}: {_describe(response)}"
         if attempt < len(_BACKOFF):
@@ -1878,7 +1911,7 @@ def send_message(
 - [ ] **Step 4: Run the telegram tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/notifier/test_telegram.py -v`
-Expected: PASS, 11 tests.
+Expected: PASS, 13 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -2276,7 +2309,7 @@ Expected: PASS, 12 tests.
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/pytest -q`
-Expected: every existing test still passes (484 at the branch point), plus 103 new ones — 587 in total.
+Expected: every existing test still passes (484 at the branch point), plus 105 new ones — 589 in total.
 
 - [ ] **Step 6: Commit**
 
