@@ -84,6 +84,32 @@ def test_parse_skips_an_event_with_a_null_time():
     assert [(m.kind, m.gw) for m in moments] == [("deadline", 5)]
 
 
+def test_parse_fpl_raises_on_a_missing_events_key():
+    """A 200 carrying `{"detail": "maintenance"}` must not parse as "no deadlines" --
+    that reading is exactly what would overwrite fetch_source's last-good cache."""
+    with pytest.raises(ValueError):
+        parse_fpl({"detail": "maintenance"})
+
+
+def test_parse_fpl_raises_on_an_empty_events_list():
+    """An empty list is indistinguishable from "no deadlines" downstream, and FPL
+    always publishes 38 gameweeks, so an empty list here is never legitimate."""
+    with pytest.raises(ValueError):
+        parse_fpl({"events": []})
+
+
+def test_parse_draft_raises_on_a_missing_data_key():
+    """`events` present but without its nested `data` list -- the Draft-shaped analogue
+    of the FPL maintenance page."""
+    with pytest.raises(ValueError):
+        parse_draft({"events": {}})
+
+
+def test_parse_draft_raises_on_an_empty_data_list():
+    with pytest.raises(ValueError):
+        parse_draft({"events": {"data": []}})
+
+
 def test_merge_unions_the_games_of_identical_moments():
     """The live check on 2026-08-22: both games put GW2 at 17:30Z. One merged moment
     means one alert instead of two saying the same thing a second apart."""

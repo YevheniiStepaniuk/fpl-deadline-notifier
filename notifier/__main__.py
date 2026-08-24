@@ -12,7 +12,7 @@ import logging
 import signal
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 
 import httpx
 
@@ -26,7 +26,8 @@ import httpx
 # Resolving through the module object looks the name up at call time instead.
 from notifier import config, sources
 from notifier.render import format_message
-from notifier.schedule import due_alerts
+from notifier.schedule import Alert, due_alerts
+from notifier.sources import Moment
 from notifier.state import State, load_state, save_state
 from notifier.telegram import TelegramError, send_message
 
@@ -48,6 +49,22 @@ def _should_refresh(
     return last_refresh is None or (now - last_refresh).total_seconds() >= refresh_seconds
 
 
+def _log_reschedules(game: str, before: list[Moment], after: list[Moment]) -> None:
+    """Report a moment whose instant has changed since the last refresh.
+
+    Alerts are keyed by gameweek, so a moved deadline deliberately does not re-send --
+    which means nothing else would ever mention that it moved.
+    """
+    was = {(m.kind, m.gw): m.when for m in before}
+    for moment in after:
+        previous = was.get((moment.kind, moment.gw))
+        if previous is not None and previous != moment.when:
+            log.info(
+                "%s %s GW%d moved: %s -> %s",
+                game, moment.kind, moment.gw, previous.isoformat(), moment.when.isoformat(),
+            )
+
+
 def _refresh(client: httpx.Client, state: State) -> None:
     """Refetch each source, keeping the previous copy of anything that fails.
 
@@ -57,7 +74,7 @@ def _refresh(client: httpx.Client, state: State) -> None:
     """
     for game in GAMES:
         try:
-            state.cached[game] = sources.fetch_source(client, game)
+            fetched = sources.fetch_source(client, game)
         except Exception as exc:
             # Deliberately broad. `fetch_source` documents httpx.HTTPError, but it also
             # parses: a 200 maintenance page raises JSONDecodeError, a malformed
@@ -68,6 +85,22 @@ def _refresh(client: httpx.Client, state: State) -> None:
             # which is the exact coupling this function exists to prevent.
             held = len(state.cached.get(game, []))
             log.warning("refresh failed for %s (%s); holding %d cached moments", game, exc, held)
+        else:
+            _log_reschedules(game, state.cached.get(game, []), fetched)
+            state.cached[game] = fetched
+
+
+def _record(state: State, alerts: Iterable[Alert]) -> None:
+    """Mark every game's key for these alerts, stamped with the moment's instant.
+
+    The stamp is what `load_state` prunes on. Gameweek ids restart at 1 each season, so
+    an unpruned store would let this season's keys suppress all of next season's, with
+    no message and nothing in the log to notice it by.
+    """
+    for alert in alerts:
+        stamp = alert.moment.when.isoformat()
+        for key in alert.keys:
+            state.sent[key] = stamp
 
 
 def run_once(
@@ -86,9 +119,9 @@ def run_once(
 
     for alert in to_retire:
         log.info("retiring %s", ", ".join(sorted(alert.keys)))
-        # Retirements are recorded whether or not a send follows, so a restart after a
-        # long outage settles in one tick instead of re-evaluating every time.
-        state.sent.update(alert.keys)
+    # Retirements are recorded whether or not a send follows, so a restart after a
+    # long outage settles in one tick instead of re-evaluating every time.
+    _record(state, to_retire)
 
     if to_send:
         try:
@@ -101,8 +134,7 @@ def run_once(
             log.info("sent %s", ", ".join(sorted(k for a in to_send for k in a.keys)))
             # Every game the alert covered, so a later divergence between the two does
             # not re-fire the half whose key was never written.
-            for alert in to_send:
-                state.sent.update(alert.keys)
+            _record(state, to_send)
 
     if to_send or to_retire or refresh:
         try:
@@ -133,7 +165,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"notifier: {exc}", file=sys.stderr)
         return 1
 
-    state = load_state(cfg.state_path)
+    state = load_state(cfg.state_path, datetime.datetime.now(datetime.UTC))
     stopping = False
 
     def stop(signum, frame):

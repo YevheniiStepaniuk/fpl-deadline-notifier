@@ -6,7 +6,7 @@ in here can be tested at an exact instant, including the boundaries.
 
 import dataclasses
 import datetime
-from collections.abc import Iterable, Set
+from collections.abc import Container, Iterable
 
 from notifier.sources import Moment
 
@@ -47,7 +47,7 @@ class Alert:
 
 def due_alerts(
     moments: Iterable[Moment],
-    sent: Set[str],
+    sent: Container[str],
     now: datetime.datetime,
 ) -> tuple[list[Alert], list[Alert]]:
     """Split the alerts whose trigger has passed into those worth sending and those not.

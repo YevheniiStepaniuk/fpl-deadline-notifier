@@ -41,8 +41,15 @@ def _parse_time(raw: str | None) -> datetime.datetime | None:
 
 
 def parse_fpl(payload: dict) -> list[Moment]:
+    events = payload.get("events")
+    # Not `.get("events", [])`. An empty list is indistinguishable from "this game has
+    # no deadlines", which is the exact misreading fetch_source raises to avoid: the
+    # caller would cache the emptiness, overwrite its last-good copy and go quiet with
+    # nothing logged. A 200 carrying a maintenance page arrives here looking like this.
+    if not isinstance(events, list) or not events:
+        raise ValueError(f"FPL payload has no usable `events` list: {type(events).__name__}")
     moments = []
-    for event in payload.get("events", []):
+    for event in events:
         when = _parse_time(event.get("deadline_time"))
         if when is not None:
             moments.append(Moment("deadline", event["id"], when, frozenset({"fpl"})))
@@ -53,8 +60,12 @@ def parse_draft(payload: dict) -> list[Moment]:
     # Draft nests the list one level deeper than classic does: `events` is a dict of
     # current/next/data rather than the list itself. Reusing parse_fpl here raises
     # TypeError, which is why the two functions exist separately.
+    events = payload.get("events")
+    data = events.get("data") if isinstance(events, dict) else None
+    if not isinstance(data, list) or not data:
+        raise ValueError(f"Draft payload has no usable `events.data` list: {type(data).__name__}")
     moments = []
-    for event in payload.get("events", {}).get("data", []):
+    for event in data:
         for kind, field in (("deadline", "deadline_time"), ("waivers", "waivers_time")):
             when = _parse_time(event.get(field))
             if when is not None:

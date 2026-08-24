@@ -1,6 +1,7 @@
 import datetime
 import functools
 import json
+import logging
 import pathlib
 import zoneinfo
 
@@ -8,10 +9,10 @@ import httpx
 import pytest
 import respx
 
-from notifier.__main__ import main, run_once, _should_refresh
+from notifier.__main__ import main, run_once, _log_reschedules, _should_refresh
 from notifier.config import Config
 from notifier.sources import DRAFT_URL, FPL_URL, Moment
-from notifier.state import State, load_state
+from notifier.state import State, load_state, save_state
 from notifier.telegram import api_url, send_message as real_send_message
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
@@ -46,7 +47,7 @@ def _mock_apis():
 def test_a_tick_two_hours_before_the_deadline_sends_one_merged_message(tmp_path):
     _mock_apis()
     send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
-    state = State(sent=set(), cached={})
+    state = State(sent={}, cached={})
     with httpx.Client() as client:
         run_once(_cfg(tmp_path), client, state, DEADLINE - datetime.timedelta(hours=2), refresh=True)
     assert send.call_count == 1
@@ -59,14 +60,14 @@ def test_a_successful_send_is_persisted_so_the_next_tick_is_silent(tmp_path):
     _mock_apis()
     send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
     cfg = _cfg(tmp_path)
-    state = State(sent=set(), cached={})
+    state = State(sent={}, cached={})
     now = DEADLINE - datetime.timedelta(hours=2)
     with httpx.Client() as client:
         run_once(cfg, client, state, now, refresh=True)
         run_once(cfg, client, state, now + datetime.timedelta(minutes=1), refresh=False)
     assert send.call_count == 1
     # Both games, because GW2's deadline is one merged moment covering the pair.
-    assert {"deadline:2:fpl:2", "deadline:2:draft:2"} <= load_state(cfg.state_path).sent
+    assert {"deadline:2:fpl:2", "deadline:2:draft:2"} <= load_state(cfg.state_path, DEADLINE).sent.keys()
 
 
 @respx.mock
@@ -87,16 +88,16 @@ def test_a_failed_send_leaves_the_key_unwritten_so_the_next_tick_retries(tmp_pat
         httpx.Response(200, json=OK),
     ])
     cfg = _cfg(tmp_path)
-    state = State(sent=set(), cached={})
+    state = State(sent={}, cached={})
     now = DEADLINE - datetime.timedelta(hours=2)
     with httpx.Client() as client:
         run_once(cfg, client, state, now, refresh=True)
         # Not `== set()`: this tick also retires the superseded 24h alert and the whole
         # of GW1, and those are written. The point is that the *failed* key is not.
-        assert "deadline:2:fpl:2" not in load_state(cfg.state_path).sent
+        assert "deadline:2:fpl:2" not in load_state(cfg.state_path, DEADLINE).sent
         run_once(cfg, client, state, now + datetime.timedelta(minutes=1), refresh=False)
     assert send.call_count == 4
-    assert "deadline:2:fpl:2" in load_state(cfg.state_path).sent
+    assert "deadline:2:fpl:2" in load_state(cfg.state_path, DEADLINE).sent
 
 
 @respx.mock
@@ -104,7 +105,7 @@ def test_nothing_due_means_no_telegram_call_at_all(tmp_path):
     _mock_apis()
     send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
     with httpx.Client() as client:
-        run_once(_cfg(tmp_path), client, State(sent=set(), cached={}),
+        run_once(_cfg(tmp_path), client, State(sent={}, cached={}),
                  DEADLINE - datetime.timedelta(days=30), refresh=True)
     assert send.call_count == 0
 
@@ -113,10 +114,10 @@ def test_nothing_due_means_no_telegram_call_at_all(tmp_path):
 def test_a_refresh_caches_both_sources_to_disk(tmp_path):
     _mock_apis()
     cfg = _cfg(tmp_path)
-    state = State(sent=set(), cached={})
+    state = State(sent={}, cached={})
     with httpx.Client() as client:
         run_once(cfg, client, state, DEADLINE - datetime.timedelta(days=30), refresh=True)
-    cached = load_state(cfg.state_path).cached
+    cached = load_state(cfg.state_path, DEADLINE).cached
     assert set(cached) == {"fpl", "draft"}
     assert cached["fpl"] and cached["draft"]
 
@@ -127,7 +128,7 @@ def test_refresh_false_makes_no_api_calls(tmp_path):
     fpl = respx.get(FPL_URL).mock(return_value=httpx.Response(200, json=_fixture("fpl_bootstrap")))
     respx.get(DRAFT_URL).mock(return_value=httpx.Response(200, json=_fixture("draft_bootstrap")))
     respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
-    state = State(sent=set(), cached={"fpl": [Moment("deadline", 2, DEADLINE, frozenset({"fpl"}))]})
+    state = State(sent={}, cached={"fpl": [Moment("deadline", 2, DEADLINE, frozenset({"fpl"}))]})
     with httpx.Client() as client:
         run_once(_cfg(tmp_path), client, state, DEADLINE - datetime.timedelta(hours=2), refresh=False)
     assert fpl.call_count == 0
@@ -139,7 +140,7 @@ def test_one_source_failing_still_sends_the_other_from_cache(tmp_path):
     respx.get(FPL_URL).mock(return_value=httpx.Response(200, json=_fixture("fpl_bootstrap")))
     respx.get(DRAFT_URL).mock(return_value=httpx.Response(503))
     send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
-    state = State(sent=set(), cached={"draft": [Moment("waivers", 2, DEADLINE, frozenset({"draft"}))]})
+    state = State(sent={}, cached={"draft": [Moment("waivers", 2, DEADLINE, frozenset({"draft"}))]})
     with httpx.Client() as client:
         run_once(_cfg(tmp_path), client, state, DEADLINE - datetime.timedelta(hours=2), refresh=True)
     text = json.loads(send.calls[0].request.read())["text"]
@@ -156,7 +157,7 @@ def test_both_sources_failing_with_no_cache_is_not_fatal(tmp_path):
     respx.get(FPL_URL).mock(return_value=httpx.Response(503))
     respx.get(DRAFT_URL).mock(side_effect=httpx.ConnectError("no route"))
     with httpx.Client() as client:
-        run_once(_cfg(tmp_path), client, State(sent=set(), cached={}),
+        run_once(_cfg(tmp_path), client, State(sent={}, cached={}),
                  DEADLINE - datetime.timedelta(hours=2), refresh=True)
 
 
@@ -167,11 +168,51 @@ def test_a_restart_after_a_long_outage_retires_stale_alerts_silently(tmp_path):
     _mock_apis()
     send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
     cfg = _cfg(tmp_path)
-    state = State(sent=set(), cached={})
+    state = State(sent={}, cached={})
     with httpx.Client() as client:
         run_once(cfg, client, state, DEADLINE + datetime.timedelta(hours=1), refresh=True)
     assert send.call_count == 0
-    assert "deadline:2:fpl:2" in load_state(cfg.state_path).sent
+    assert "deadline:2:fpl:2" in load_state(cfg.state_path, DEADLINE).sent
+
+
+@respx.mock
+def test_a_season_rollover_does_not_silence_the_next_seasons_alerts(tmp_path):
+    """The defect this fix exists for: FPL's gameweek ids restart at 1 every season, so
+    a spent key from last season must not still be sitting there to block this one.
+
+    Without pruning, `load_state` would hand back these keys intact, `due_alerts` would
+    find GW2's keys already spent, and the tick below would send nothing at all."""
+    _mock_apis()
+    send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    cfg = _cfg(tmp_path)
+    a_year_ago = (DEADLINE - datetime.timedelta(days=365)).isoformat()
+    save_state(cfg.state_path, State(
+        sent={"deadline:2:fpl:2": a_year_ago, "deadline:2:draft:2": a_year_ago},
+        cached={},
+    ))
+    now = DEADLINE - datetime.timedelta(hours=2)
+    state = load_state(cfg.state_path, now)
+    assert state.sent == {}
+    with httpx.Client() as client:
+        run_once(cfg, client, state, now, refresh=True)
+    assert send.call_count == 1
+
+
+def test_a_moved_deadline_is_logged(caplog):
+    """The spec's promised log line for a reschedule -- the only visibility into one,
+    since alerts are keyed by gameweek and deliberately do not re-send."""
+    before = [Moment("deadline", 2, DEADLINE, frozenset({"fpl"}))]
+    after = [Moment("deadline", 2, DEADLINE + datetime.timedelta(hours=1), frozenset({"fpl"}))]
+    with caplog.at_level(logging.INFO, logger="notifier"):
+        _log_reschedules("fpl", before, after)
+    assert "moved" in caplog.text
+
+
+def test_an_unmoved_deadline_is_not_logged(caplog):
+    moments = [Moment("deadline", 2, DEADLINE, frozenset({"fpl"}))]
+    with caplog.at_level(logging.INFO, logger="notifier"):
+        _log_reschedules("fpl", moments, moments)
+    assert "moved" not in caplog.text
 
 
 @respx.mock
@@ -186,7 +227,7 @@ def test_an_unwritable_state_file_does_not_kill_the_tick(tmp_path, monkeypatch):
 
     monkeypatch.setattr("notifier.__main__.save_state", boom)
     with httpx.Client() as client:
-        run_once(_cfg(tmp_path), client, State(sent=set(), cached={}),
+        run_once(_cfg(tmp_path), client, State(sent={}, cached={}),
                  DEADLINE - datetime.timedelta(hours=2), refresh=True)
     assert send.call_count == 1
 
