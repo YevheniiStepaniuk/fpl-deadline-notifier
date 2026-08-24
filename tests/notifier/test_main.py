@@ -198,6 +198,56 @@ def test_a_season_rollover_does_not_silence_the_next_seasons_alerts(tmp_path):
     assert send.call_count == 1
 
 
+@respx.mock
+def test_a_long_lived_process_prunes_across_the_season_boundary(tmp_path):
+    """The finding this fix closes: `load_state` only prunes what it reads, so a
+    process that never restarts -- the operating mode this service is built for --
+    would carry last season's keys across the June boundary forever. Built in memory,
+    deliberately bypassing `load_state`, since the whole point is that startup is not
+    what does the pruning here.
+
+    Both offsets are seeded, not just the 2-hour one: last season's GW2 ran to
+    completion, so its 24-hour key was written too. Seeding only the 2-hour key would
+    leave the 24-hour alert's key absent and let it fire on its own regardless of
+    pruning, which would make this test pass for the wrong reason."""
+    _mock_apis()
+    send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    cfg = _cfg(tmp_path)
+    stale = (DEADLINE - datetime.timedelta(days=365)).isoformat()
+    state = State(
+        sent={
+            "deadline:2:fpl:2": stale, "deadline:2:draft:2": stale,
+            "deadline:2:fpl:24": stale, "deadline:2:draft:24": stale,
+        },
+        cached={},
+    )
+    with httpx.Client() as client:
+        run_once(cfg, client, state, DEADLINE - datetime.timedelta(hours=2), refresh=True)
+    assert send.call_count == 1
+
+
+@respx.mock
+def test_a_current_sent_key_is_not_pruned_mid_tick(tmp_path):
+    """The other half of the same change: pruning on the tick must not turn into a
+    duplicate alert for a key whose moment has not gone stale. Both offsets are seeded
+    for the same reason as above -- an absent 24-hour key would fire on its own and
+    the assertion below would fail regardless of whether pruning behaves correctly."""
+    _mock_apis()
+    send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    cfg = _cfg(tmp_path)
+    current = DEADLINE.isoformat()
+    state = State(
+        sent={
+            "deadline:2:fpl:2": current, "deadline:2:draft:2": current,
+            "deadline:2:fpl:24": current, "deadline:2:draft:24": current,
+        },
+        cached={},
+    )
+    with httpx.Client() as client:
+        run_once(cfg, client, state, DEADLINE - datetime.timedelta(hours=2), refresh=True)
+    assert send.call_count == 0
+
+
 def test_a_moved_deadline_is_logged(caplog):
     """The spec's promised log line for a reschedule -- the only visibility into one,
     since alerts are keyed by gameweek and deliberately do not re-send."""

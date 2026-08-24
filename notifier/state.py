@@ -57,7 +57,7 @@ def _moment_from_json(raw: dict) -> Moment:
     return Moment(raw["kind"], int(raw["gw"]), when, frozenset(games))
 
 
-def _prune_sent(raw_sent: object, now: datetime.datetime) -> dict[str, str]:
+def prune_sent(raw_sent: object, now: datetime.datetime) -> dict[str, str]:
     """Keep only keys whose moment is within KEEP_SENT_FOR of `now`.
 
     Every entry is shape-checked and degrades by omission rather than raising, matching
@@ -100,7 +100,7 @@ def load_state(path: pathlib.Path, now: datetime.datetime) -> State:
     # otherwise raise from inside set() or .items(), and raising is the one thing this
     # loader must not do: refusing to start over a file it could simply ignore is how a
     # deadline gets missed.
-    sent = _prune_sent(raw.get("sent"), now)
+    sent = prune_sent(raw.get("sent"), now)
 
     raw_cached = raw.get("cached")
     cached: dict[str, list[Moment]] = {}

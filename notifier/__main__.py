@@ -28,7 +28,7 @@ from notifier import config, sources
 from notifier.render import format_message
 from notifier.schedule import Alert, due_alerts
 from notifier.sources import Moment
-from notifier.state import State, load_state, save_state
+from notifier.state import KEEP_SENT_FOR, State, load_state, prune_sent, save_state
 from notifier.telegram import TelegramError, send_message
 
 log = logging.getLogger("notifier")
@@ -113,6 +113,20 @@ def run_once(
     """One tick: maybe refetch, work out what is owed, send it, record it."""
     if refresh:
         _refresh(client, state)
+        # Pruning belongs to the tick, not only to startup. `load_state` prunes what it
+        # reads, but this is a service meant to still be running next year: a process
+        # that stays up across the June season boundary would otherwise keep last
+        # season's keys forever, and gameweek ids restart at 1 -- so the new season's
+        # GW1 alert would be suppressed with no message and nothing in the log. Hourly,
+        # alongside the refetch, is far more often than a 30-day window needs.
+        kept = prune_sent(state.sent, now)
+        if len(kept) != len(state.sent):
+            log.info(
+                "forgot %d sent key(s) whose moment is more than %s past",
+                len(state.sent) - len(kept),
+                KEEP_SENT_FOR,
+            )
+        state.sent = kept
 
     moments = sources.merge(*state.cached.values())
     to_send, to_retire = due_alerts(moments, state.sent, now)

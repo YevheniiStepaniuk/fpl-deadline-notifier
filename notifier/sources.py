@@ -77,7 +77,8 @@ _SOURCES = {"fpl": (FPL_URL, parse_fpl), "draft": (DRAFT_URL, parse_draft)}
 
 
 def fetch_source(client: httpx.Client, game: str) -> list[Moment]:
-    """Fetch and parse one game's deadlines. Raises httpx.HTTPError on any failure.
+    """Fetch and parse one game's deadlines. Raises on any failure: httpx.HTTPError from
+    the transport, ValueError from a payload with no usable `events`.
 
     Raising rather than returning [] is load-bearing: the caller falls back to its
     cached copy, and an empty list would instead read as "this game has no deadlines"
