@@ -1,0 +1,31 @@
+# Template, not an installed unit. Copy to /etc/systemd/system/, edit the three paths,
+# then: systemctl daemon-reload && systemctl enable --now fpl-notifier
+[Unit]
+Description=FPL and Draft PL deadline notifier
+# Only orders startup; the service handles a missing network by holding its cache.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGEME
+WorkingDirectory=/CHANGEME/path/to/Fantasy PL
+EnvironmentFile=/CHANGEME/path/to/Fantasy PL/.env
+ExecStart=/CHANGEME/path/to/Fantasy PL/.venv/bin/python -m notifier
+Restart=always
+RestartSec=30
+# Restarting freely is safe: sent keys are on disk, so a restart cannot resend, and
+# stale suppression means a long outage produces silence rather than a burst.
+
+# Python buffers stdout when it is a pipe, which would hold log lines back from
+# journalctl for minutes at a time on a service this quiet.
+Environment=PYTHONUNBUFFERED=1
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/CHANGEME/path/to/Fantasy PL/data
+
+[Install]
+WantedBy=multi-user.target
