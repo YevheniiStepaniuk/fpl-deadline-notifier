@@ -311,3 +311,29 @@ Cases that must be covered:
 - One source failing falls back to cache for that source only.
 - A corrupt state file is treated as empty without raising.
 - A deadline in the BST/GMT changeover week renders with the right offset and abbreviation.
+
+## Known limitations
+
+Recorded during review and deliberately left as they are. None is reachable in normal operation;
+they are here so the next reader does not have to rediscover them.
+
+- **A deadline moved by more than a month can produce a second alert.** Sent keys are stamped with
+  their moment's instant and forgotten 30 days after it. If the Premier League postponed a
+  gameweek by more than that, the key would already be gone and the alert would fire again. This
+  is a deviation from "keyed by gameweek, so a rescheduled deadline is not resent" above, in the
+  one case where the reschedule outlives the memory of it. A duplicate reminder is the harmless
+  direction to fail in.
+- **Upgrading from a state file written before pruning costs at most one duplicate.** Those files
+  store `sent` as a list rather than a map, which the loader cannot date and so discards. On the
+  first tick after upgrading, an alert already delivered for a still-future moment may be sent
+  once more. Bounded to that one tick.
+- **A `Moment` with an empty `games` set would never alert.** It would yield no keys, and an alert
+  with no keys reads as already sent. Unreachable: both parsers construct `games` non-empty, `merge`
+  only unions non-empty sets, and the state loader rejects a cached moment whose `games` is not a
+  non-empty list. Worth remembering before adding a third game.
+- **`render` raises on an unrecognised `kind`.** `_WHAT[kind]` is a bare lookup, which is
+  inconsistent with that module's "return empty rather than raise" contract elsewhere. Unreachable:
+  `kind` comes from a two-entry literal in `sources`.
+- **Shutdown can take one more tick.** `time.sleep` resumes after a signal handler returns (PEP
+  475), so a `SIGTERM` mid-sleep waits out the remaining `poll_seconds` and runs a final tick before
+  exiting. A tick is idempotent and this is well inside systemd's default `TimeoutStopSec`.
