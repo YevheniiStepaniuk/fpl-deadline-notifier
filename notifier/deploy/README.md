@@ -36,6 +36,35 @@ fpl-notifier.service` catches the first problem before you enable anything; the 
 shows up only as a permission error at the first save. Cloning to a path without spaces
 avoids the question entirely and is the easier route if you have the choice.
 
+## Docker
+
+The image carries `httpx` and nothing else — that is the notifier's only third-party
+import, so the dashboard's streamlit/pandas/anthropic stack stays out of it. 220MB,
+running as uid 10001 with a read-only root filesystem and all capabilities dropped.
+
+    docker compose -f notifier/deploy/docker-compose.yml up -d --build
+    docker compose -f notifier/deploy/docker-compose.yml logs -f
+
+Check it first, which needs no compose file:
+
+    docker build -f notifier/deploy/Dockerfile -t fpl-notifier .
+    docker run --rm -v fpl-notifier-state:/data \
+      -e TELEGRAM_BOT_TOKEN=... -e TELEGRAM_CHAT_ID=... fpl-notifier --once
+
+Two things about it worth knowing.
+
+The compose file names the three variables it needs individually instead of using
+`env_file: .env`. That file also holds `ANTHROPIC_API_KEY` and `OPENROUTER_API_KEY` for
+the dashboard, and there is no reason to put either inside a container that talks only to
+Telegram and the two Premier League APIs. Compose still reads `.env` for the `${...}`
+values, so nothing changes about where you keep them.
+
+The state volume is a *named* volume, deliberately. The container runs unprivileged, so a
+bind mount would arrive owned by your host user and the first save would fail with
+`EACCES` — which this service survives by design, logging and carrying on, meaning you
+would not notice until a restart re-sent an alert. If you do want a bind mount, `chown`
+the directory to uid 10001 first.
+
 ## macOS launchd
 
 systemd is not available. Run it under a `launchd` agent with `KeepAlive`, or in a
@@ -57,3 +86,4 @@ and the Draft waiver deadline. See the spec's timetable:
 | Nothing arrives, logs are quiet | Normal between alerts. `cat data/notifier_state.json` to see the cached deadlines and the keys already handled. |
 | An alert never arrived | Its key is in `sent` — either it was delivered, or it was retired because the process was down until after the moment passed. |
 | Alerts stopped after an edit | `.venv/bin/pytest tests/notifier -q`. The isolation test catches an accidental `app/` import. |
+| Under Docker: nothing in the volume | The container could not write `/data`. Named volume, or `chown` the bind mount to uid 10001. |

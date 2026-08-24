@@ -1,0 +1,50 @@
+# Run from the repository root:
+#   docker compose -f notifier/deploy/docker-compose.yml up -d --build
+#
+# Compose reads `.env` from the directory it runs in for the ${...} values below.
+services:
+  notifier:
+    build:
+      context: ../..
+      dockerfile: notifier/deploy/Dockerfile
+    image: fpl-notifier
+    container_name: fpl-notifier
+
+    # Named individually rather than with `env_file: .env`. That file also holds
+    # ANTHROPIC_API_KEY and OPENROUTER_API_KEY for the dashboard, and this service has
+    # no use for either -- there is no reason to put them inside a container that talks
+    # only to Telegram and the two Premier League APIs. `:?` fails the run with a named
+    # variable rather than starting a notifier that can never send anything.
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN in .env}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:?set TELEGRAM_CHAT_ID in .env}
+      NOTIFIER_TZ: ${NOTIFIER_TZ:-Europe/London}
+      NOTIFIER_POLL_SECONDS: ${NOTIFIER_POLL_SECONDS:-60}
+      NOTIFIER_REFRESH_SECONDS: ${NOTIFIER_REFRESH_SECONDS:-3600}
+
+    # A named volume, not a bind mount. The container runs as uid 10001, and a bind
+    # mount would arrive owned by the host user, so the first save would fail with
+    # EACCES -- which the service survives by design, logging and carrying on, meaning
+    # you would only notice when a restart re-sent an alert.
+    volumes:
+      - notifier-state:/data
+
+    # Restarting freely is safe: sent keys live in the volume, so a restart cannot
+    # re-send, and a moment already past is retired silently rather than announced.
+    restart: unless-stopped
+
+    # Nothing listens, nothing is served, and the only writable path is the volume.
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  notifier-state:
