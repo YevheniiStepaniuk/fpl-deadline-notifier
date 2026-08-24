@@ -2426,8 +2426,16 @@ rerunning.
 Create `notifier/deploy/fpl-notifier.service`:
 
 ```ini
-# Template, not an installed unit. Copy to /etc/systemd/system/, edit the three paths,
-# then: systemctl daemon-reload && systemctl enable --now fpl-notifier
+# Template, not an installed unit. Copy to /etc/systemd/system/, edit the paths, then:
+# systemctl daemon-reload && systemctl enable --now fpl-notifier
+#
+# Mind the quotes on ExecStart and ReadWritePaths. This project's own directory is
+# "Personal Projects/Fantasy PL" -- two spaces -- and systemd splits both of those
+# settings on whitespace. Unquoted, ExecStart would try to run a binary called
+# ".../Personal" and ReadWritePaths would name two directories that do not exist, so
+# the service would fail to start and, worse, would silently lose write access to
+# data/ under ProtectSystem=strict. WorkingDirectory and EnvironmentFile take a single
+# value each and need no quoting.
 [Unit]
 Description=FPL and Draft PL deadline notifier
 # Only orders startup; the service handles a missing network by holding its cache.
@@ -2439,7 +2447,7 @@ Type=simple
 User=CHANGEME
 WorkingDirectory=/CHANGEME/path/to/Fantasy PL
 EnvironmentFile=/CHANGEME/path/to/Fantasy PL/.env
-ExecStart=/CHANGEME/path/to/Fantasy PL/.venv/bin/python -m notifier
+ExecStart="/CHANGEME/path/to/Fantasy PL/.venv/bin/python" -m notifier
 Restart=always
 RestartSec=30
 # Restarting freely is safe: sent keys are on disk, so a restart cannot resend, and
@@ -2453,7 +2461,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/CHANGEME/path/to/Fantasy PL/data
+ReadWritePaths="/CHANGEME/path/to/Fantasy PL/data"
 
 [Install]
 WantedBy=multi-user.target
@@ -2493,6 +2501,14 @@ Copy `fpl-notifier.service` to `/etc/systemd/system/`, replace every `CHANGEME`,
     sudo systemctl daemon-reload
     sudo systemctl enable --now fpl-notifier
     journalctl -u fpl-notifier -f
+
+**If your checkout path contains a space** — this project's default one does, twice —
+keep the double quotes already present on `ExecStart` and `ReadWritePaths`. systemd
+splits both of those on whitespace, so an unquoted path fails to start the service and
+silently drops the write permission `data/` needs. `systemd-analyze verify
+fpl-notifier.service` catches the first problem before you enable anything; the second
+shows up only as a permission error at the first save. Cloning to a path without spaces
+avoids the question entirely and is the easier route if you have the choice.
 
 ## macOS launchd
 
