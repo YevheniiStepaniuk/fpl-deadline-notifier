@@ -28,6 +28,14 @@ Copy `fpl-notifier.service` to `/etc/systemd/system/`, replace every `CHANGEME`,
     sudo systemctl enable --now fpl-notifier
     journalctl -u fpl-notifier -f
 
+**If your checkout path contains a space** — this project's default one does, twice —
+keep the double quotes already present on `ExecStart` and `ReadWritePaths`. systemd
+splits both of those on whitespace, so an unquoted path fails to start the service and
+silently drops the write permission `data/` needs. `systemd-analyze verify
+fpl-notifier.service` catches the first problem before you enable anything; the second
+shows up only as a permission error at the first save. Cloning to a path without spaces
+avoids the question entirely and is the easier route if you have the choice.
+
 ## macOS launchd
 
 systemd is not available. Run it under a `launchd` agent with `KeepAlive`, or in a
