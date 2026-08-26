@@ -29,11 +29,13 @@ from notifier.render import format_intro, format_message
 from notifier.schedule import Alert, due_alerts
 from notifier.sources import Moment
 from notifier.state import (
+    KEEP_PENDING_FOR,
     KEEP_SENT_FOR,
     State,
     decode_pending_greeting,
     encode_pending_greeting,
     load_state,
+    prune_pending_greetings,
     prune_sent,
     save_state,
 )
@@ -290,6 +292,22 @@ def run_once(
                 KEEP_SENT_FOR,
             )
         state.sent = kept
+
+        # Same fix as `sent`'s, for the same reason. `load_state` prunes
+        # `pending_greetings` too, but a process that never restarts would otherwise
+        # never re-check a stale entry's age -- exactly the gap a whole-branch review
+        # once found in `sent`'s load-only pruning, on a process that stayed up across
+        # the June boundary. Only touched when something is actually dropped, so a
+        # tick that prunes nothing does not rewrite `state` for no reason.
+        kept_pending = prune_pending_greetings(state.pending_greetings, now)
+        if len(kept_pending) != len(state.pending_greetings):
+            log.info(
+                "forgot %d pending greeting(s) whose first-seen stamp is more than "
+                "%s past",
+                len(state.pending_greetings) - len(kept_pending),
+                KEEP_PENDING_FOR,
+            )
+            state.pending_greetings = kept_pending
 
     moments = sources.merge(*state.cached.values())
     to_send, to_retire = due_alerts(moments, state.sent, now)

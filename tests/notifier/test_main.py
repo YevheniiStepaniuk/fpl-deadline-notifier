@@ -12,7 +12,7 @@ import respx
 from notifier.__main__ import main, run_once, _greet, _log_reschedules, _should_refresh
 from notifier.config import Config
 from notifier.sources import DRAFT_URL, FPL_URL, Moment
-from notifier.state import State, encode_pending_greeting, load_state, save_state
+from notifier.state import KEEP_PENDING_FOR, State, encode_pending_greeting, load_state, save_state
 from notifier.telegram import api_url, send_message as real_send_message
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
@@ -685,3 +685,23 @@ def test_a_bad_key_in_pending_greetings_does_not_block_a_good_one(tmp_path):
         run_once(cfg, client, state, NOT_DUE, refresh=True)
     assert send.call_count == 1
     assert "-100999" in state.greeted
+
+
+@respx.mock
+def test_a_long_lived_process_ages_out_a_stale_pending_greeting(tmp_path):
+    """Round 3's finding, mirroring `test_a_long_lived_process_prunes_across_the_
+    season_boundary` above for the identical shape of bug in `pending_greetings`:
+    `load_state` prunes it too, but a process that never restarts -- the operating
+    mode this service is built for -- would otherwise never re-check a stale entry's
+    age. Built in memory, deliberately bypassing `load_state`, since the whole point
+    is that startup is not what does the pruning here."""
+    _mock_apis()
+    cfg = _cfg(tmp_path)
+    stale = NOT_DUE - KEEP_PENDING_FOR - datetime.timedelta(seconds=1)
+    state = State(
+        sent={}, cached={},
+        pending_greetings={"-100999": encode_pending_greeting(stale, "Old")},
+    )
+    with httpx.Client() as client:
+        run_once(cfg, client, state, NOT_DUE, refresh=True)
+    assert "-100999" not in state.pending_greetings

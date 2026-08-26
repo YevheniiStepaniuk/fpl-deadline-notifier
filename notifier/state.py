@@ -166,9 +166,18 @@ def decode_pending_greeting(value: str) -> tuple[datetime.datetime, str] | None:
     return first_seen, title
 
 
-def _load_pending_greetings(raw: object, now: datetime.datetime) -> dict[str, str]:
+def prune_pending_greetings(raw: object, now: datetime.datetime) -> dict[str, str]:
     """Keep only entries whose key is a chat id and whose value decodes to a
     first-seen stamp within `KEEP_PENDING_FOR` of `now`.
+
+    Called from two places, exactly like `prune_sent`: once inside `load_state`, on
+    the raw untrusted JSON, and once inside `run_once`'s tick, on the already-clean
+    in-memory dict. `sent` needed both because pruning only at load meant a process
+    that stays up across the June season boundary never pruned at all -- a review
+    caught it and the fix added the tick-time call alongside the load-time one.
+    `pending_greetings` is the same shape of bug for the same reason: a process that
+    never restarts would otherwise never re-check a stale entry's age, and this is
+    what makes both fields follow one policy instead of two.
 
     The key check is not cosmetic: `_greet` calls `int(key)` to build the chat id
     `format_intro` needs, and used to do that before ever attempting a send. One
@@ -232,7 +241,7 @@ def load_state(path: pathlib.Path, now: datetime.datetime) -> State:
         cached=cached,
         update_offset=_load_update_offset(raw.get("update_offset")),
         greeted=_load_greeted(raw.get("greeted")),
-        pending_greetings=_load_pending_greetings(raw.get("pending_greetings"), now),
+        pending_greetings=prune_pending_greetings(raw.get("pending_greetings"), now),
         # polling_disabled is deliberately not restored here -- see the field's own
         # comment on State. Every fresh load starts able to poll again.
     )
