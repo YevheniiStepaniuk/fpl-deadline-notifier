@@ -705,3 +705,51 @@ def test_a_long_lived_process_ages_out_a_stale_pending_greeting(tmp_path):
     with httpx.Client() as client:
         run_once(cfg, client, state, NOT_DUE, refresh=True)
     assert "-100999" not in state.pending_greetings
+
+
+# --- fix round 4: bot-level vs chat-level permanent failures ------------------------
+
+
+@respx.mock
+def test_a_401_leaves_the_pending_entry_for_retry_after_the_token_is_fixed(tmp_path):
+    """NEW FINDING (round 4). 401 is about the *token*, not this chat -- a revoked
+    token would 401 on every pending intro in the same tick, and dropping them all as
+    chat-permanent would mean none of them is ever greeted again, even after the
+    operator fixes the token and restarts: Telegram will not redeliver a
+    my_chat_member update once the offset has moved past it. Contrast with the 403
+    case above (`test_a_permanently_rejected_chat_is_dropped_not_retried_forever`),
+    which genuinely is about the chat and is correctly dropped."""
+    respx.get(UPDATES_URL).mock(side_effect=_offset_aware_single_add(-100999))
+    send = respx.post(SEND_URL).mock(
+        return_value=httpx.Response(401, json={"ok": False, "description": "Unauthorized"})
+    )
+    cfg = _cfg(tmp_path)
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        run_once(cfg, client, state, NOT_DUE, refresh=False)
+    assert "-100999" in state.pending_greetings
+    assert "-100999" not in state.greeted
+    assert send.call_count == 1  # 401 fails fast, no retry loop inside send_message
+
+
+@respx.mock
+def test_a_pending_entry_left_by_a_401_is_greeted_once_sends_start_succeeding(tmp_path):
+    """The point of leaving it pending rather than dropping it: once the operator has
+    fixed the token, the chat a 401 spared still gets its intro on a later,
+    refreshing tick -- without ever being rediscovered through getUpdates, since that
+    add event will not come round again."""
+    respx.get(UPDATES_URL).mock(side_effect=_offset_aware_single_add(-100999))
+    send = respx.post(SEND_URL).mock(side_effect=[
+        httpx.Response(401, json={"ok": False, "description": "Unauthorized"}),  # tick 1
+        httpx.Response(200, json=OK),                                            # tick 2
+    ])
+    cfg = _cfg(tmp_path)
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        run_once(cfg, client, state, NOT_DUE, refresh=False)
+        assert "-100999" in state.pending_greetings
+        assert "-100999" not in state.greeted
+        run_once(cfg, client, state, NOT_DUE, refresh=True)  # retry needs refresh=True
+    assert "-100999" in state.greeted
+    assert "-100999" not in state.pending_greetings
+    assert send.call_count == 2

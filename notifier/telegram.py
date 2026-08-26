@@ -30,11 +30,22 @@ class TelegramError(Exception):
     from simply running out of attempts against a transient failure. The caller uses
     it to decide whether retrying is worth anything at all, rather than retrying a
     chat that will never accept a message again.
+
+    `status_code` carries the HTTP status behind a permanent failure (`None` when
+    `permanent` is False, since attempts-exhausted has no single status to name --
+    the failures across the three tries need not even be the same kind). `permanent`
+    alone conflates two different claims: 400/403 are about *this chat* -- kicked,
+    blocked, not allowed to post there -- and giving up on it is correct, but
+    401/404 are about the *token* and say nothing about any particular chat. A caller
+    that wants "will this specific chat never accept a message" rather than "was
+    this HTTP call not worth retrying" needs the status code to tell those apart;
+    see `notifier/__main__.py`'s `_BOT_LEVEL_STATUSES`.
     """
 
-    def __init__(self, message: str, *, permanent: bool) -> None:
+    def __init__(self, message: str, *, permanent: bool, status_code: int | None = None) -> None:
         super().__init__(message)
         self.permanent = permanent
+        self.status_code = status_code
 
 
 def api_url(token: str, method: str = "sendMessage") -> str:
@@ -85,6 +96,7 @@ def send_message(
                     f"Telegram rejected the message with {response.status_code}: "
                     f"{_describe(response)}",
                     permanent=True,
+                    status_code=response.status_code,
                 )
             if response.status_code == 200:
                 try:

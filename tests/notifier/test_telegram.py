@@ -101,6 +101,34 @@ def test_a_400_is_not_retried():
 
 
 @respx.mock
+def test_a_permanent_status_sets_permanent_true_and_carries_its_status_code():
+    """`.permanent` is what `_greet` reads to decide a chat is not worth retrying, and
+    `.status_code` is what lets it further tell a chat-level permanent failure
+    (400/403) apart from a token-level one (401/404) -- see
+    notifier/__main__.py's `_BOT_LEVEL_STATUSES`. Asserted here at the source rather
+    than only behaviourally through test_main.py."""
+    respx.post(URL).mock(
+        return_value=httpx.Response(401, json={"ok": False, "description": "Unauthorized"})
+    )
+    with httpx.Client() as client, pytest.raises(TelegramError) as excinfo:
+        send_message(client, TOKEN, CHAT, "hello", sleep=lambda _: None)
+    assert excinfo.value.permanent is True
+    assert excinfo.value.status_code == 401
+
+
+@respx.mock
+def test_exhausted_attempts_sets_permanent_false_and_no_status_code():
+    """Running out of attempts against a transient failure is a different claim from a
+    permanent status, and there is no single status code to name: the three attempts
+    need not even fail the same way."""
+    respx.post(URL).mock(return_value=httpx.Response(500))
+    with httpx.Client() as client, pytest.raises(TelegramError) as excinfo:
+        send_message(client, TOKEN, CHAT, "hello", sleep=lambda _: None)
+    assert excinfo.value.permanent is False
+    assert excinfo.value.status_code is None
+
+
+@respx.mock
 def test_a_429_is_retried():
     """Rate limiting is transient, unlike the other 4xx cases."""
     route = respx.post(URL).mock(side_effect=[

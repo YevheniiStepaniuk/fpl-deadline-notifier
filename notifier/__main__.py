@@ -46,6 +46,16 @@ log = logging.getLogger("notifier")
 
 GAMES = ("fpl", "draft")
 
+# A permanent TelegramError is not always about the chat it was sent to. 400 (chat
+# not found) and 403 (bot blocked or kicked) genuinely are, and giving up on that one
+# chat is correct. 401 (bad token) and 404 (unknown bot) are about the *token* --
+# every pending chat gets the same status in the same tick, and dropping them all as
+# chat-permanent would mean none of them is ever greeted, even after the operator
+# fixes the token and restarts: Telegram will not redeliver a my_chat_member update
+# once the offset has moved past it. So these two are excluded from the drop
+# decision below and left pending instead, to retry once the token is good again.
+_BOT_LEVEL_STATUSES = {401, 404}
+
 
 def _should_refresh(
     last_refresh: datetime.datetime | None,
@@ -245,20 +255,23 @@ def _poll_and_greet(
         try:
             send_message(client, cfg.bot_token, key, text)
         except TelegramError as exc:
-            if exc.permanent:
-                # Telegram has said, unambiguously, that this will not go through --
-                # blocked, kicked, or a chat that no longer exists. Retrying is not
-                # patience, it is the exact pathology `PermanentPollError` was just
-                # introduced to remove from the poll side, reappearing on the send
-                # side: one request and one log line every tick, forever, for a chat
-                # that will never accept the message.
+            if exc.permanent and exc.status_code not in _BOT_LEVEL_STATUSES:
+                # Telegram has said, unambiguously, that *this chat* will not go
+                # through -- blocked, kicked, or gone. Retrying is not patience, it
+                # is the exact pathology `PermanentPollError` was just introduced to
+                # remove from the poll side, reappearing on the send side: one
+                # request and one log line every tick, forever, for a chat that will
+                # never accept the message.
                 log.error("giving up on chat %s: %s", key, exc)
                 del state.pending_greetings[key]
                 changed = True
             else:
                 # Left in `pending_greetings`, so a later tick retries -- the same
                 # asymmetry `run_once` already uses for alerts: a chat that never
-                # sees the intro is worse than one that sees it twice.
+                # sees the intro is worse than one that sees it twice. Also where a
+                # 401/404 lands: those are about the token, not this chat, and
+                # dropping the entry would mean it is never greeted even after the
+                # token is fixed, since Telegram will not redeliver the add event.
                 log.error("intro to chat %s failed, will retry later: %s", key, exc)
             continue
         log.info("greeted chat %s", key)
