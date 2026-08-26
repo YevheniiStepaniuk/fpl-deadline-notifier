@@ -77,6 +77,31 @@ systemd is not available. Run it under a `launchd` agent with `KeepAlive`, or in
 terminal multiplexer if the machine is a desktop that stays awake. Note that a sleeping
 Mac sends nothing — the design assumes an always-on host.
 
+## The /nextdeadline command
+
+Anyone in the chat can send `/nextdeadline` to get the next deadline on demand, with the
+real time remaining. Asking does **not** consume the scheduled reminder — that still
+arrives at its proper time.
+
+The command works whether or not it is registered with Telegram, but registering it puts
+it in the autocomplete and the bot's menu so people can find it. That is a one-off call
+against the bot, not part of the service, so it does not happen on deploy:
+
+    docker run --rm --env-file .env --entrypoint python fpl-notifier -c "
+    import os, httpx
+    t = os.environ['TELEGRAM_BOT_TOKEN']
+    httpx.post(f'https://api.telegram.org/bot{t}/setMyCommands',
+               json={'commands': [{'command': 'nextdeadline',
+                                   'description': 'Show the next FPL or Draft deadline'}]})"
+
+One thing to know about delivery. A bot in a group normally only receives messages that
+are commands or mention it — Telegram calls this privacy mode, and it is on by default.
+If it has been turned off for this bot via BotFather, the bot receives every message in
+the group instead. Either way `/nextdeadline` arrives, and non-command messages are
+parsed and discarded without being logged or stored; but it is worth knowing which mode
+your bot is in if the group has people in it. Check with `getMe` and read
+`can_read_all_group_messages`: true means privacy mode is off.
+
 ## What it sends
 
 Four messages per gameweek, at 24 hours and 2 hours before each of the gameweek deadline
