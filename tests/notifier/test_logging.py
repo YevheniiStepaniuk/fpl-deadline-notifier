@@ -191,7 +191,7 @@ def test_end_to_end_a_real_tick_never_logs_the_bot_token(monkeypatch, tmp_path, 
     whether anyone actually attached it. `logging.basicConfig` is called only from
     `main`, and that is where the filter gets attached to the handler -- so this
     drives a real `main(["--once"])` tick against a respx-mocked Telegram, using
-    `fetch_added`/`send_message` exactly as the service does, and inspects the actual
+    `fetch_updates`/`send_message` exactly as the service does, and inspects the actual
     captured stdout. If a future edit moves or drops the `handler.addFilter(...)`
     call in `main`, this is the test that notices -- a filter-only unit test above
     would keep passing right through that regression.

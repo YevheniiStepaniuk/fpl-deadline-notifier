@@ -535,7 +535,7 @@ def test_a_permanent_poll_failure_stops_polling_for_the_rest_of_the_process(tmp_
 
 @respx.mock
 def test_an_unexpected_exception_anywhere_in_greet_does_not_escape_run_once(tmp_path, monkeypatch):
-    """Finding: only fetch_added's call used to be isolated. Nothing realistic raises
+    """Finding: only fetch_updates's call used to be isolated. Nothing realistic raises
     out of format_intro or a chat's send today, but `_greet` is called from `main`'s
     `while True`, which has no try of its own -- anything that did escape here would
     end the process and every future deadline alert with it. This breaks a step nobody
@@ -753,3 +753,158 @@ def test_a_pending_entry_left_by_a_401_is_greeted_once_sends_start_succeeding(tm
     assert "-100999" in state.greeted
     assert "-100999" not in state.pending_greetings
     assert send.call_count == 2
+
+
+def test_greeting_logs_the_chat_id_and_title(tmp_path, caplog):
+    """Change 1's other half: the chat id used to be spelled out in the intro's own
+    text (see test_render.py's test_the_intro_no_longer_mentions_configuration_
+    details), which the owner asked removed since a shared group is not where the
+    operator reads it. It still has to land somewhere the operator *does* look --
+    `docker logs` -- so this pins that a successful greeting logs both the id and the
+    title, not just a bare 'greeted chat'."""
+    cfg = _cfg(tmp_path)
+    state = State(sent={}, cached={})
+    with respx.mock:
+        respx.get(UPDATES_URL).mock(return_value=httpx.Response(200, json={
+            "ok": True, "result": [_added_update(1, -100999, title="News")],
+        }))
+        respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+        with httpx.Client() as client, caplog.at_level(logging.INFO, logger="notifier"):
+            _greet(cfg, client, state, [], NOT_DUE, True)
+    assert "-100999" in caplog.text
+    assert "News" in caplog.text
+
+
+# --- /nextdeadline -------------------------------------------------------------------
+
+
+def _command_update(update_id, chat_id, text, chat_type="group"):
+    return {
+        "update_id": update_id,
+        "message": {
+            "message_id": 1,
+            "date": 1735689600,
+            "chat": {"id": chat_id, "type": chat_type},
+            "from": {"id": 1, "is_bot": False, "first_name": "Someone"},
+            "text": text,
+        },
+    }
+
+
+def _offset_aware_single_command(chat_id, text):
+    """The command counterpart of `_offset_aware_single_add`: reports one command on
+    the first (offsetless) poll, nothing on any later one, so a multi-tick test does
+    not keep rediscovering -- and re-replying to -- the same message forever."""
+    update = _command_update(1, chat_id, text)
+
+    def handler(request):
+        if request.url.params.get("offset") is None:
+            return httpx.Response(200, json={"ok": True, "result": [update]})
+        return httpx.Response(200, json={"ok": True, "result": []})
+
+    return handler
+
+
+@respx.mock
+def test_nextdeadline_replies_to_the_asking_chat_not_the_configured_one(tmp_path):
+    """`cfg.chat_id` ("987" in these tests) is where scheduled alerts go; a
+    /nextdeadline reply must go to whoever asked instead."""
+    _mock_apis()
+    respx.get(UPDATES_URL).mock(side_effect=_offset_aware_single_command(-555, "/nextdeadline"))
+    send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    cfg = _cfg(tmp_path)
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        run_once(cfg, client, state, NOT_DUE, refresh=True)
+    bodies = [json.loads(c.request.read()) for c in send.calls]
+    assert {b["chat_id"] for b in bodies} == {"-555"}
+
+
+@respx.mock
+def test_nextdeadline_with_a_bot_username_suffix_also_triggers(tmp_path):
+    """Telegram commonly suffixes group commands with the bot's own username --
+    `/nextdeadline@fantasyreminderbot` has to reach the same code path as the bare
+    form."""
+    _mock_apis()
+    respx.get(UPDATES_URL).mock(
+        side_effect=_offset_aware_single_command(-555, "/nextdeadline@fantasyreminderbot")
+    )
+    send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    cfg = _cfg(tmp_path)
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        run_once(cfg, client, state, NOT_DUE, refresh=True)
+    assert send.call_count == 1
+
+
+@respx.mock
+def test_a_lookalike_message_does_not_trigger_a_reply(tmp_path):
+    """A message that merely mentions the command must not fire it -- see
+    parse_commands' own tests for the pure-function version of this; this is the
+    end-to-end confirmation that __main__ never gets the chance to reply to one."""
+    _mock_apis()
+    respx.get(UPDATES_URL).mock(
+        side_effect=_offset_aware_single_command(-555, "please run /nextdeadline later")
+    )
+    send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    cfg = _cfg(tmp_path)
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        run_once(cfg, client, state, NOT_DUE, refresh=True)
+    assert send.call_count == 0
+
+
+@respx.mock
+def test_nextdeadline_does_not_touch_state_sent_so_the_scheduled_alert_still_fires(tmp_path):
+    """The owner's explicit callout, given its own test as asked: /nextdeadline must
+    never write to `state.sent` -- only a real, scheduled send may. Proven the strong
+    way, not just by inspecting `state.sent` after the command tick: a command is
+    answered on a tick well before the real alert is due, then a second tick is run at
+    the real trigger time and the scheduled alert is confirmed to still go out. If the
+    command path had accidentally recorded the alert's key, this second tick would
+    silently send nothing -- `due_alerts` would find the key already spent."""
+    _mock_apis()
+    respx.get(UPDATES_URL).mock(side_effect=_offset_aware_single_command(-555, "/nextdeadline"))
+    send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    cfg = _cfg(tmp_path)
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        run_once(cfg, client, state, NOT_DUE, refresh=True)
+        assert state.sent == {}
+        assert send.call_count == 1  # only the /nextdeadline reply, nothing due yet
+        run_once(cfg, client, state, DEADLINE - datetime.timedelta(hours=2), refresh=True)
+    # The command was only seen once (see _offset_aware_single_command), so this
+    # second tick's one new send is the real, scheduled alert.
+    assert send.call_count == 2
+    body = json.loads(send.calls[-1].request.read())
+    assert body["chat_id"] == "987"
+    assert body["text"] == "⏰ GW2 deadline in 2 hours\nFPL + Draft · Fri 28 Aug, 18:30 BST"
+    assert "deadline:2:fpl:2" in state.sent
+
+
+@respx.mock
+def test_a_failed_nextdeadline_reply_does_not_disturb_the_alert_or_the_offset(tmp_path, monkeypatch):
+    """Isolation, the same shape as `test_a_getupdates_outage_does_not_stop_a_deadline_
+    alert`: a /nextdeadline reply that fails outright must not take a real, due
+    scheduled alert down with it, and must not leave the update queue wedged -- the
+    offset still has to advance so the same undeliverable command is not redelivered
+    forever."""
+    monkeypatch.setattr(
+        "notifier.__main__.send_message",
+        functools.partial(real_send_message, sleep=lambda _: None),
+    )
+    respx.get(FPL_URL).mock(return_value=httpx.Response(200, json=_fixture("fpl_bootstrap")))
+    respx.get(DRAFT_URL).mock(return_value=httpx.Response(200, json=_fixture("draft_bootstrap")))
+    respx.get(UPDATES_URL).mock(side_effect=_offset_aware_single_command(-555, "/nextdeadline"))
+    send = respx.post(SEND_URL).mock(side_effect=[
+        httpx.Response(200, json=OK),  # the real alert, sent first (see run_once)
+        httpx.Response(500), httpx.Response(500), httpx.Response(500),  # the reply, exhausted
+    ])
+    cfg = _cfg(tmp_path)
+    state = State(sent={}, cached={})
+    now = DEADLINE - datetime.timedelta(hours=2)
+    with httpx.Client() as client:
+        run_once(cfg, client, state, now, refresh=True)  # must not raise
+    assert send.call_count == 4
+    assert "deadline:2:fpl:2" in state.sent  # the alert went through and was recorded
+    assert state.update_offset == 2  # advanced despite the reply failing

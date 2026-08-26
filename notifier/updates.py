@@ -1,13 +1,17 @@
-"""Detecting the bot being added to a chat, via `getUpdates`.
+"""Detecting the bot being added to a chat, and any `/command` sent to it, via
+`getUpdates`.
 
 Split from the network the same way `sources.py` splits `parse_fpl` from
-`fetch_source`: `parse_added` is pure, so the add/demote/promote cases are testable
-without a socket. This service still never *reads* Telegram in the conversational
-sense -- it only watches for the one event type that tells it a new chat exists.
+`fetch_source`: `parse_added`/`parse_commands` are pure, so the add/demote/promote
+cases and the command-matching rules are testable without a socket. This service
+still never *reads* Telegram in the conversational sense -- `allowed_updates` below
+means it is handed only membership changes and messages that are themselves commands
+or mention the bot, never general chatter.
 """
 
 import dataclasses
 import json
+import re
 
 import httpx
 
@@ -15,11 +19,27 @@ from notifier.telegram import api_url
 
 TIMEOUT = 15.0
 
-# Passed as `allowed_updates` to getUpdates so Telegram queues only membership changes.
-# Without this, an ordinary channel post or group message would sit in the update
-# backlog for a service that has no code path that ever reads it -- growing forever
-# and eventually forcing an offset jump just to clear it.
-ALLOWED_UPDATES = ["my_chat_member"]
+# Passed as `allowed_updates` to getUpdates so Telegram queues only what this service
+# ever looks at: membership changes, and messages (for slash commands). Without this,
+# an ordinary channel post would sit in the update backlog for a service that has no
+# code path that ever reads it -- growing forever and eventually forcing an offset
+# jump just to clear it. Adding "message" does not open the floodgates to normal group
+# chatter: bot privacy mode is on by default (and this bot has never disabled it), so
+# in a group Telegram hands the bot only messages that are commands or that @-mention
+# it -- everyone else's conversation is invisible to it regardless of allowed_updates.
+ALLOWED_UPDATES = ["my_chat_member", "message"]
+
+# `/command` or `/command@some_bot`, matched at the very start of the (whitespace-
+# trimmed) text and only there -- "please run /nextdeadline" must not trigger, since
+# that is a sentence about the command, not an invocation of it. The optional
+# `@botname` suffix is how a command looks in a group when it needs disambiguating
+# from another bot's command of the same name; accepted without checking it actually
+# names *this* bot, because privacy mode hands every bot in the chat every message
+# that starts with "/" regardless of which bot the suffix names, so a stricter check
+# here would not stop `/nextdeadline@some_other_bot` from arriving -- it would only
+# make this bot ignore its own command when addressed precisely. Whether the *name*
+# is one this service recognises is decided by the caller (`__main__`), not here.
+_COMMAND_RE = re.compile(r"^/(?P<name>[a-z0-9_]+)(?:@[\w-]+)?(?:\s|$)", re.IGNORECASE)
 
 # A `my_chat_member` update fires on every status transition, not just an add: a
 # promotion from member to administrator is one of these too, and so is a demotion.
@@ -42,6 +62,22 @@ class ChatAdded:
     chat_id: int
     title: str | None
     chat_type: str  # "channel" | "group" | "supergroup" | "private"
+
+
+@dataclasses.dataclass(frozen=True)
+class Command:
+    """One recognised `/command` invocation, from whichever chat sent it.
+
+    A separate type from `ChatAdded`, not a shared "update" grab-bag, so `__main__`
+    can decide what to do with each by its own type rather than by inspecting some
+    tag field -- the same reason `parse_added` returns a list of `ChatAdded` rather
+    than raw dicts. `name` is already lowercased and has any `@botname` suffix
+    stripped -- see `_COMMAND_RE` -- so a caller compares it against a plain string
+    like `"nextdeadline"` and never has to repeat that normalisation itself.
+    """
+
+    chat_id: int
+    name: str
 
 
 class PermanentPollError(Exception):
@@ -148,13 +184,62 @@ def parse_added(payload: dict) -> tuple[list[ChatAdded], int | None]:
     return added, highest
 
 
-def fetch_added(
+def parse_commands(payload: dict) -> tuple[list[Command], int | None]:
+    """Pull `/command` invocations out of a getUpdates payload, plus the highest
+    update_id seen -- the same contract as `parse_added`, deliberately: an empty or
+    malformed payload means nothing happened and is skipped rather than raised on, and
+    the highest update_id is taken across *every* entry in `result`, not only the ones
+    that turned out to be commands, so a malformed or irrelevant update still gets
+    acknowledged. Given the same payload, this returns the same `highest` as
+    `parse_added` would, since both walk the same `result` list the same way -- the
+    caller (`fetch_updates`) relies on that rather than reconciling two numbers.
+    """
+    if not isinstance(payload, dict):
+        return [], None
+    result = payload.get("result")
+    if not isinstance(result, list):
+        return [], None
+
+    commands: list[Command] = []
+    highest: int | None = None
+    for update in result:
+        if not isinstance(update, dict):
+            continue
+        update_id = update.get("update_id")
+        if isinstance(update_id, int) and not isinstance(update_id, bool):
+            highest = update_id if highest is None else max(highest, update_id)
+
+        message = update.get("message")
+        if not isinstance(message, dict):
+            continue
+        chat = message.get("chat")
+        text = message.get("text")
+        if not isinstance(chat, dict) or not isinstance(text, str):
+            continue
+        chat_id = chat.get("id")
+        if not isinstance(chat_id, int):
+            continue
+        match = _COMMAND_RE.match(text.strip())
+        if match is None:
+            continue
+        commands.append(Command(chat_id=chat_id, name=match.group("name").lower()))
+    return commands, highest
+
+
+def fetch_updates(
     client: httpx.Client, token: str, offset: int | None
-) -> tuple[list[ChatAdded], int | None]:
-    """Short-poll getUpdates once and return the add-events plus the highest update_id
-    seen, exactly as `parse_added` returns it -- raw, not incremented. Converting that
-    into the next call's offset (highest + 1) is the caller's job, the same place that
-    owns `state.update_offset`.
+) -> tuple[list[ChatAdded], list[Command], int | None]:
+    """Short-poll getUpdates once and return both the add-events and the command
+    invocations in this batch, plus the highest update_id seen -- raw, not
+    incremented; converting that into the next call's offset (highest + 1) is the
+    caller's job, the same place that owns `state.update_offset`.
+
+    One GET, not two: both `parse_added` and `parse_commands` run over the single
+    payload this call fetches, rather than each doing their own poll. A second poll
+    would consume its own offset and risk skipping over updates the first poll's
+    parse never looked at -- the same kind of "advance the offset without acting on
+    what it skipped" bug `state.pending_greetings` exists to prevent on the greeting
+    side.
 
     `timeout=0` asks Telegram for a short poll rather than its default long poll, so
     this call returns immediately and fits inside the existing tick loop with no
@@ -187,4 +272,11 @@ def fetch_added(
             "the process restarts."
         )
     response.raise_for_status()
-    return parse_added(response.json())
+    payload = response.json()
+    added, highest_from_added = parse_added(payload)
+    commands, highest_from_commands = parse_commands(payload)
+    # Either one alone already covers the whole `result` list (see both docstrings);
+    # `is not None` rather than `or` just in case a future edit narrows one parser to
+    # only its own update type, where `0 or x` would wrongly fall through to `x`.
+    highest = highest_from_added if highest_from_added is not None else highest_from_commands
+    return added, commands, highest

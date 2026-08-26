@@ -1,7 +1,7 @@
 import datetime
 import zoneinfo
 
-from notifier.render import format_intro, format_message
+from notifier.render import format_intro, format_message, format_next
 from notifier.schedule import Alert
 from notifier.sources import Moment
 
@@ -89,40 +89,129 @@ def test_an_empty_alert_list_renders_empty():
     assert format_message([], LONDON) == ""
 
 
-def test_the_intro_names_the_chats_own_id_so_it_can_be_copied_into_env():
-    """The whole reason the intro exists: the chat id is not knowable beforehand, so
-    the message has to hand it back."""
-    text = format_intro(-100123, "News", GW2_DEADLINE, LONDON)
-    assert "-100123" in text
-    assert "TELEGRAM_CHAT_ID" in text
+def test_the_intro_no_longer_mentions_configuration_details():
+    """The owner's ask: the intro used to end by stating the chat's numeric id and
+    telling the reader to set TELEGRAM_CHAT_ID in .env -- correct for the operator,
+    noise for everyone else in a shared group who will never touch a .env file. None
+    of that belongs in the message any more; see format_intro's own docstring for
+    where the id went instead (a log line, not this text)."""
+    text = format_intro("News", GW2_DEADLINE, LONDON)
+    assert "-100123" not in text
+    assert ".env" not in text
+    assert "TELEGRAM_CHAT_ID" not in text
 
 
 def test_the_intro_names_the_next_deadline_using_the_same_time_format_as_alerts():
     """Reuses format_message's own %Z formatting, so the intro and a real alert never
     disagree about what 18:30 BST looks like."""
-    text = format_intro(-100123, "News", GW2_DEADLINE, LONDON)
+    text = format_intro("News", GW2_DEADLINE, LONDON)
     assert "GW2" in text
     assert "Fri 28 Aug, 18:30 BST" in text
 
 
 def test_the_intro_has_no_awkward_gap_when_there_is_no_next_deadline():
     """Between seasons there may be no future deadline at all."""
-    text = format_intro(-100123, "News", None, LONDON)
+    text = format_intro("News", None, LONDON)
     assert "GW" not in text
     assert "\n\n\n" not in text
 
 
 def test_the_intro_says_what_the_service_sends():
-    """Four alerts a gameweek: 24h and 2h before both the gameweek deadline and the
-    Draft waiver deadline."""
-    text = format_intro(-100123, "News", GW2_DEADLINE, LONDON)
-    assert "24 hours" in text
-    assert "2 hours" in text
+    """Four reminders a gameweek: a day and two hours before both the transfer
+    deadline and the Draft waiver window."""
+    text = format_intro("News", GW2_DEADLINE, LONDON)
+    assert "24 hours" not in text  # the technical "offset_hours" phrasing is gone too
+    assert "a day" in text
+    assert "two hours" in text
     assert "waiver" in text.lower()
 
 
 def test_the_intro_survives_a_chat_with_no_title():
     """Telegram does not send a title for every chat type; the message must still
-    read sensibly with one missing."""
-    text = format_intro(42, None, None, LONDON)
-    assert "42" in text
+    read sensibly with one missing, and must not crash on the None."""
+    text = format_intro(None, None, LONDON)
+    assert "this chat" in text
+
+
+def test_the_intro_names_a_titled_chat():
+    """A titled chat gets a warmer, more specific greeting than the untitled
+    fallback -- pins that `title` still does something now that it is no longer
+    spent on `format_intro`'s old 'added to "X"' sentence."""
+    text = format_intro("News", None, LONDON)
+    assert '"News"' in text
+
+
+def test_the_intro_mentions_nextdeadline():
+    """Change 2 adds the /nextdeadline command; the intro is where someone in the
+    chat would learn it exists at all."""
+    text = format_intro("News", GW2_DEADLINE, LONDON)
+    assert "/nextdeadline" in text
+
+
+# --- format_next ---------------------------------------------------------------------
+
+
+def test_format_next_states_hours_and_minutes_remaining():
+    """The whole point of format_next: real time remaining, not the scheduled alert's
+    canned "in 24 hours" -- that phrasing is only true the instant an alert fires on
+    schedule and would be wrong almost every time it was reused here."""
+    now = DEADLINE - datetime.timedelta(hours=9, minutes=12, seconds=30)
+    text = format_next(GW2_DEADLINE, now, LONDON)
+    assert text == "⏰ GW2 deadline in 9 hours 12 minutes\nFPL + Draft · Fri 28 Aug, 18:30 BST"
+
+
+def test_format_next_under_an_hour_has_no_hours_component():
+    now = DEADLINE - datetime.timedelta(minutes=45)
+    text = format_next(GW2_DEADLINE, now, LONDON)
+    assert "in 45 minutes" in text
+    assert "hour" not in text
+
+
+def test_format_next_under_a_minute_counts_seconds():
+    now = DEADLINE - datetime.timedelta(seconds=30)
+    text = format_next(GW2_DEADLINE, now, LONDON)
+    assert "in 30 seconds" in text
+
+
+def test_format_next_singular_units_are_not_pluralised():
+    """1 hour, 1 minute, 1 second must each read as singular -- "1 hours" is the kind
+    of thing a naive f-string ships by accident."""
+    assert "in 1 hour\n" in format_next(GW2_DEADLINE, DEADLINE - datetime.timedelta(hours=1), LONDON)
+    assert "in 1 minute\n" in format_next(GW2_DEADLINE, DEADLINE - datetime.timedelta(minutes=1), LONDON)
+    assert "in 1 second\n" in format_next(GW2_DEADLINE, DEADLINE - datetime.timedelta(seconds=1), LONDON)
+
+
+def test_format_next_on_the_exact_boundary_says_right_now():
+    """now == moment.when is the awkward case the spec calls out by name: "in 0
+    seconds" would read like a typo, and a naive computation could even go negative."""
+    text = format_next(GW2_DEADLINE, DEADLINE, LONDON)
+    assert "right now" in text
+    assert "in 0" not in text
+    assert "in -" not in text
+
+
+def test_format_next_names_a_waiver_window_not_a_deadline():
+    now = WAIVERS - datetime.timedelta(hours=2)
+    text = format_next(GW2_WAIVERS, now, LONDON)
+    assert "waiver window closes" in text
+    assert text.splitlines()[1].startswith("Draft · ")
+
+
+def test_format_next_with_no_upcoming_moment_is_pleasant():
+    """Between seasons, or after the last gameweek's last deadline, there may be
+    nothing left to report -- this must read as a normal reply, not an error."""
+    text = format_next(None, DEADLINE, LONDON)
+    assert text
+    assert "GW" not in text
+
+
+def test_format_next_does_not_reuse_the_scheduled_alerts_wording():
+    """The spec's explicit requirement: the on-demand reply must never say "in 24
+    hours" or "in 2 hours" the way a scheduled alert does, since those are only true
+    the instant an alert fires exactly on its trigger."""
+    now = DEADLINE - datetime.timedelta(hours=24)
+    text = format_next(GW2_DEADLINE, now, LONDON)
+    assert "in 24 hours" in text  # coincidentally true this once, at exactly T-24h ...
+    now = DEADLINE - datetime.timedelta(hours=23, minutes=59)
+    text = format_next(GW2_DEADLINE, now, LONDON)
+    assert "in 24 hours" not in text  # ... but false one minute later, unlike format_message

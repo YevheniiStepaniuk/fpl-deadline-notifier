@@ -26,7 +26,7 @@ import httpx
 # fails only when both test modules run together, which is the worst way to find out.
 # Resolving through the module object looks the name up at call time instead.
 from notifier import config, sources
-from notifier.render import format_intro, format_message
+from notifier.render import format_intro, format_message, format_next
 from notifier.schedule import Alert, due_alerts
 from notifier.sources import Moment
 from notifier.state import (
@@ -41,7 +41,7 @@ from notifier.state import (
     save_state,
 )
 from notifier.telegram import TelegramError, send_message
-from notifier.updates import PermanentPollError, fetch_added
+from notifier.updates import Command, PermanentPollError, fetch_updates
 
 log = logging.getLogger("notifier")
 
@@ -130,6 +130,19 @@ def _next_deadline(moments: Iterable[Moment], now: datetime.datetime) -> Moment 
     return min(upcoming, key=lambda m: m.when, default=None)
 
 
+def _next_moment(moments: Iterable[Moment], now: datetime.datetime) -> Moment | None:
+    """The earliest still-future moment of *either* kind, for /nextdeadline.
+
+    Deliberately not `_next_deadline`: that one only ever offers a gameweek deadline,
+    which is right for the one-time intro (a waiver window closing sooner would be a
+    strange thing to greet someone with), but wrong for someone asking "what's next" --
+    a Draft waiver window closing in two hours is more next than a deadline four days
+    away, and the reply should say so.
+    """
+    upcoming = [m for m in moments if m.when > now]
+    return min(upcoming, key=lambda m: m.when, default=None)
+
+
 def _greet(
     cfg: config.Config,
     client: httpx.Client,
@@ -186,9 +199,16 @@ def _poll_and_greet(
     failing (rate limits, a Telegram-side blip) would cost three attempts with 1s/4s
     backoff every 60 seconds, forever, for something nobody is waiting on with the
     same urgency as a brand-new add.
+
+    `/nextdeadline` replies live in this same function, sharing its poll rather than
+    running their own: nothing about answering a command writes to `state`, so unlike
+    a greeting there is nothing to retry and no reason to gate a reply on `refresh` --
+    it is always attempted the tick the command arrives in. A failed reply is only
+    logged, never allowed to raise past this function; see the loop below.
     """
     changed = False
     just_added: set[str] = set()
+    commands: list[Command] = []
 
     if state.polling_disabled:
         # Already given up this process's lifetime -- see `PermanentPollError` and
@@ -197,7 +217,7 @@ def _poll_and_greet(
         pass
     else:
         try:
-            added, highest = fetch_added(client, cfg.bot_token, state.update_offset)
+            added, commands, highest = fetch_updates(client, cfg.bot_token, state.update_offset)
         except PermanentPollError as exc:
             # Logged once, here, and never again this process: the cause needs a
             # restart to clear, so repeating the warning every tick would just be
@@ -256,7 +276,7 @@ def _poll_and_greet(
             continue
 
         _first_seen, title = decoded
-        text = format_intro(chat_id, title or None, next_deadline, cfg.tz)
+        text = format_intro(title or None, next_deadline, cfg.tz)
         try:
             send_message(client, cfg.bot_token, key, text)
         except TelegramError as exc:
@@ -279,10 +299,44 @@ def _poll_and_greet(
                 # token is fixed, since Telegram will not redeliver the add event.
                 log.error("intro to chat %s failed, will retry later: %s", key, exc)
             continue
-        log.info("greeted chat %s", key)
+        # The chat id used to be spelled out in the message itself (see
+        # `format_intro`'s docstring) so the operator could copy it into `.env`. Now
+        # that it is not, this line is the only place it is still recorded -- in
+        # `docker logs`, where the operator actually reads, rather than in a shared
+        # chat full of people who have no use for it.
+        log.info("greeted chat %s (title=%r)", key, title or None)
         state.greeted.add(key)
         del state.pending_greetings[key]
         changed = True
+
+    for command in commands:
+        if command.name != "nextdeadline":
+            # The only command this service understands today. An unrecognised one is
+            # silently ignored rather than replied to with an error -- Telegram's own
+            # privacy-mode filtering already means *some* command traffic reaches here
+            # (this bot's own commands plus, in a group, any other bot's), and this is
+            # not the place to start maintaining a list of every command that exists
+            # elsewhere just to say "not mine."
+            continue
+        # Replies go to whichever chat asked, not to `cfg.chat_id` -- deliberately;
+        # see this function's own docstring. That is safe rather than a missing
+        # allowlist because a deadline is public information, published on the FPL
+        # and Draft sites themselves, and the reply names nothing about this
+        # deployment beyond what `/nextdeadline` itself already reveals (that the bot
+        # is present and listening) -- there is no private data this could leak.
+        text = format_next(_next_moment(moments, now), now, cfg.tz)
+        try:
+            send_message(client, cfg.bot_token, str(command.chat_id), text)
+        except TelegramError as exc:
+            # Logged and dropped, not retried: unlike a greeting, there is no
+            # `state` record of "this chat is owed a reply" for a later tick to act
+            # on, and there should not be one -- the asker is still there and can
+            # just ask again. Never allowed to escape this loop: one failed reply
+            # must not stop the next command in the same batch from being answered,
+            # matching the per-chat isolation the greeting loop above already has.
+            log.error("reply to /nextdeadline for chat %s failed: %s", command.chat_id, exc)
+        else:
+            log.info("replied to /nextdeadline for chat %s", command.chat_id)
     return changed
 
 
