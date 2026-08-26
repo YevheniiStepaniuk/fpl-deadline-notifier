@@ -337,3 +337,10 @@ they are here so the next reader does not have to rediscover them.
 - **Shutdown can take one more tick.** `time.sleep` resumes after a signal handler returns (PEP
   475), so a `SIGTERM` mid-sleep waits out the remaining `poll_seconds` and runs a final tick before
   exiting. A tick is idempotent and this is well inside systemd's default `TimeoutStopSec`.
+- **A basic group that migrates to a supergroup stops receiving alerts, silently.** Migration
+  changes the chat id from `-123…` to `-100…`, and a send to the dead id answers 400, which
+  `telegram.py` classifies as permanent — so it logs once, gives up, and no further alert for that
+  gameweek is attempted. Telegram's response carries the new id in `parameters.migrate_to_chat_id`,
+  so following it automatically is possible and was deliberately not built: the deployment this was
+  written for uses a basic group nobody is changing. If alerts ever stop for no visible reason,
+  check whether the group was upgraded and update `TELEGRAM_CHAT_ID`.
