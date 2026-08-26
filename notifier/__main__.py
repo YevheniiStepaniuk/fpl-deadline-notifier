@@ -218,12 +218,16 @@ def _poll_and_greet(
                 key = str(chat.chat_id)
                 if key in state.greeted or key in state.pending_greetings:
                     continue
-                # Private chats are included on purpose, not an oversight: Telegram
-                # sends my_chat_member the moment a user first /start's the bot, and
-                # that genuinely is the setup flow -- it is how you learn your own
-                # chat id if you want alerts sent to a DM rather than a channel. The
-                # `greeted`/`pending_greetings` dedupe above is what keeps this
-                # bounded to one message per chat rather than one per /start.
+                # Private chats are included on purpose, not an oversight -- but they
+                # fire far more rarely than they look like they should. The API says
+                # "for private chats, this update is received only when the bot is
+                # blocked or unblocked by the user", so /start produces nothing: a DM
+                # is greeted only on an unblock. Channels and groups are the real case,
+                # where being added is exactly this transition. Do not read a silent
+                # DM as a bug and go looking for the fault in here.
+                #
+                # The `greeted`/`pending_greetings` dedupe above bounds it to one
+                # message per chat regardless.
                 state.pending_greetings[key] = encode_pending_greeting(now, chat.title or "")
                 just_added.add(key)
                 changed = True
