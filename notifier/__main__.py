@@ -9,6 +9,7 @@ rather than a test per rule.
 import argparse
 import datetime
 import logging
+import re
 import signal
 import sys
 import time
@@ -356,15 +357,81 @@ def run_once(
             log.error("could not write %s: %s", cfg.state_path, exc)
 
 
+# `/bot` followed by the token shape Telegram issues -- digits, a colon, then
+# alphanumerics/underscores/hyphens -- and nothing past it, so `/getUpdates` or
+# `/sendMessage` right after the token is left alone. Matched by shape rather than by
+# the configured token itself: a filter keyed on one known value stops redacting the
+# moment any *other* token-shaped string reaches the logs (a retry against a second
+# bot, a copy-pasted example in an error body), with no signal that it has stopped.
+_TOKEN_IN_PATH = re.compile(r"(?<=/bot)\d+:[\w-]+")
+
+
+def _redact(value: object) -> object:
+    """Redact a token from one value, or return it unchanged if there is nothing to do.
+
+    httpx passes the request URL as a `URL` object, not a `str` -- the token only
+    shows up once it is stringified, so conversion is not optional here. Values that
+    do not stringify to something containing a token (an int status code, a plain
+    log message) come back exactly as given, not as a stringified copy: `%d` in
+    httpx's own format string needs the status code to still be an int, not `str(200)`.
+    """
+    try:
+        text = value if isinstance(value, str) else str(value)
+        if _TOKEN_IN_PATH.search(text):
+            return _TOKEN_IN_PATH.sub("REDACTED", text)
+    except Exception:
+        # Must never raise -- see _TokenRedactingFilter. Worst case here is a value
+        # that fails to stringify passes through un-redacted, same as it would have
+        # gone in unfiltered.
+        pass
+    return value
+
+
+class _TokenRedactingFilter(logging.Filter):
+    """Strip Telegram bot tokens out of every record before it reaches a handler.
+
+    httpx logs the request URL as a lazy `%s` argument -- `logger.info('HTTP Request:
+    %s %s "%s %d %s"', method, url, ...)` -- so the token lives in `record.args`, not
+    in `record.msg`. A filter that only rewrote `msg` would look correct, pass a test
+    built around a pre-formatted string, and redact nothing once httpx actually logs a
+    request. `args` can be a tuple (the httpx case) or, for a caller using
+    `%(name)s`-style formatting, a dict -- both are handled; anything else is left
+    alone rather than guessed at.
+
+    `filter()` always returns True: a filter that raises takes its record out and,
+    depending on the handler, possibly more than that. This runs on every request the
+    service makes for the life of the process, so a bug here must degrade to "did not
+    redact", never to "broke logging".
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            record.msg = _redact(record.msg)
+            if isinstance(record.args, dict):
+                record.args = {k: _redact(v) for k, v in record.args.items()}
+            elif isinstance(record.args, tuple):
+                record.args = tuple(_redact(v) for v in record.args)
+        except Exception:
+            pass
+        return True
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="notifier", description=__doc__)
     parser.add_argument("--once", action="store_true", help="run one tick and exit")
     args = parser.parse_args(argv)
 
+    # The filter is attached to the handler directly, rather than added to the root
+    # logger after the fact, so there is no window -- and no second call site to keep
+    # in sync -- where a handler exists without it. httpx logs at INFO with the token
+    # in the request path (see api_url's comment); without this, that line reaches
+    # docker logs / journald in plaintext on the very first poll.
+    handler = logging.StreamHandler(sys.stdout)
+    handler.addFilter(_TokenRedactingFilter())
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
-        stream=sys.stdout,
+        handlers=[handler],
     )
 
     try:
