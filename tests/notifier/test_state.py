@@ -10,6 +10,7 @@ from notifier.state import (
     State,
     decode_pending_greeting,
     encode_pending_greeting,
+    load_banter_state,
     load_state,
     save_state,
 )
@@ -368,6 +369,77 @@ def test_a_fresh_pending_greeting_survives_load(tmp_path):
         "sent": {}, "cached": {}, "pending_greetings": {"-1": value},
     }))
     assert load_state(path, NOW).pending_greetings == {"-1": value}
+
+
+def test_a_fresh_state_defaults_the_banter_fields_too():
+    """Every existing State() call site (this file's own MOMENT-based ones included)
+    builds without banter_used/banter_last_target; both need a default or every one
+    of those breaks, matching test_a_fresh_state_defaults_the_new_fields_..._above."""
+    state = State(sent={}, cached={})
+    assert state.banter_used == frozenset()
+    assert state.banter_last_target is None
+
+
+def test_banter_state_round_trips(tmp_path):
+    path = tmp_path / "state.json"
+    save_state(path, State(
+        sent={}, cached={}, banter_used=frozenset({"3", "7"}), banter_last_target="@romanusyk",
+    ))
+    restored = load_state(path, NOW)
+    assert restored.banter_used == frozenset({"3", "7"})
+    assert restored.banter_last_target == "@romanusyk"
+
+
+def test_banter_used_is_saved_as_a_sorted_list_not_a_set(tmp_path):
+    """JSON has no set type, and a stable on-disk order keeps the file's diffs sane
+    across saves -- the same reason `greeted` is sorted before it is written."""
+    path = tmp_path / "state.json"
+    save_state(path, State(sent={}, cached={}, banter_used=frozenset({"20", "3", "7"})))
+    raw = json.loads(path.read_text())
+    assert raw["banter_used"] == ["20", "3", "7"]
+
+
+def test_load_banter_state_round_trips_a_good_pair():
+    used, target = load_banter_state(["3", "7"], "@romanusyk")
+    assert used == frozenset({"3", "7"})
+    assert target == "@romanusyk"
+
+
+def test_load_banter_state_round_trips_no_target():
+    used, target = load_banter_state(["1"], None)
+    assert used == frozenset({"1"})
+    assert target is None
+
+
+@pytest.mark.parametrize(
+    "raw_used, raw_target",
+    [
+        ("not-a-list", None),  # wrong shape entirely
+        ([1, 2, 3], None),  # non-string entries
+        (["1"], 42),  # non-string, non-None target
+        (["1", None], "@a"),  # a bad entry mixed with a good one
+    ],
+)
+def test_load_banter_state_degrades_a_corrupt_pair_to_a_fresh_cycle(raw_used, raw_target):
+    """The spec's explicit requirement: a corrupt banter state must never disable
+    the feature, only cost it the current cycle's progress -- the same 'degrade by
+    omission, never raise' discipline every other field in this module follows."""
+    used, target = load_banter_state(raw_used, raw_target)
+    assert used == frozenset()
+    assert target is None
+
+
+def test_a_corrupt_banter_state_on_disk_loads_as_a_fresh_cycle(tmp_path):
+    """The behavioural version of the pure-function test above: a hand-edited or
+    schema-drifted state.json must not disable banter, only reset its cycle."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "sent": {}, "cached": {},
+        "banter_used": "not-a-list", "banter_last_target": 42,
+    }))
+    state = load_state(path, NOW)
+    assert state.banter_used == frozenset()
+    assert state.banter_last_target is None
 
 
 def test_polling_disabled_does_not_survive_a_save_and_load_round_trip(tmp_path):

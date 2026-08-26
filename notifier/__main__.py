@@ -9,13 +9,16 @@ rather than a test per rule.
 import argparse
 import datetime
 import logging
+import random
 import re
 import signal
 import sys
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 
 import httpx
+
+from notifier.banter import next_banter
 
 # `config` is imported as a module, not unpacked with `from ... import`, and the
 # difference is load-bearing. tests/notifier/test_config.py reloads notifier.config to
@@ -123,6 +126,37 @@ def _record(state: State, alerts: Iterable[Alert]) -> None:
         stamp = alert.moment.when.isoformat()
         for key in alert.keys:
             state.sent[key] = stamp
+
+
+def _append_banter(
+    cfg: config.Config,
+    state: State,
+    rand: Callable[[int], int] = random.randrange,
+) -> str | None:
+    """One rendered banter line to append, or None if there is nothing to append --
+    banter is off, or picking one failed. `rand` defaults to real randomness in
+    production; tests inject a deterministic stand-in, the same pattern `now` uses
+    everywhere else in this module.
+
+    This is the only place `next_banter` is called, and the whole body sits behind
+    one broad except: banter is decoration on a message that must go out regardless,
+    and the caller (`run_once`/`_poll_and_greet`) has no try of its own around the
+    couple of lines that call this -- an alert must never be lost to a bug in a
+    joke. A picker that fails leaves `state` untouched (the exception is raised
+    before either return value is assigned), so a bad pick costs nothing more than
+    a missing punchline this one time; the next call tries again from the same
+    cycle position.
+    """
+    if not cfg.banter_enabled:
+        return None
+    try:
+        text, used, target = next_banter(state.banter_used, state.banter_last_target, cfg.roster, rand)
+    except Exception as exc:
+        log.error("banter picker failed and was skipped: %s", exc)
+        return None
+    state.banter_used = used
+    state.banter_last_target = target
+    return text
 
 
 def _next_deadline(moments: Sequence[Moment], now: datetime.datetime) -> Moment | None:
@@ -330,6 +364,11 @@ def _poll_and_greet(
         # deployment beyond what `/nextdeadline` itself already reveals (that the bot
         # is present and listening) -- there is no private data this could leak.
         text = format_next(_next_moment(moments, now), now, cfg.tz)
+        # Same separator as the scheduled alert, and the same reasoning: the answer
+        # to "what's next" stays scannable at the top, the banter underneath it.
+        banter = _append_banter(cfg, state)
+        if banter:
+            text = f"{text}\n\n{banter}"
         try:
             send_message(client, cfg.bot_token, str(command.chat_id), text)
         except TelegramError as exc:
@@ -396,8 +435,16 @@ def run_once(
     _record(state, to_retire)
 
     if to_send:
+        text = format_message(to_send, cfg.tz)
+        # A blank line, not a plain newline, so the deadline content -- the part
+        # someone glancing at a notification actually needs -- stays visually
+        # separate from the punchline underneath it rather than reading as one more
+        # line of it.
+        banter = _append_banter(cfg, state)
+        if banter:
+            text = f"{text}\n\n{banter}"
         try:
-            send_message(client, cfg.bot_token, cfg.chat_id, format_message(to_send, cfg.tz))
+            send_message(client, cfg.bot_token, cfg.chat_id, text)
         except TelegramError as exc:
             # Deliberately not recorded. The next tick retries, and keeps retrying
             # until it succeeds or the moment passes and retirement takes over.

@@ -70,6 +70,15 @@ class State:
     # what resets this back to False. Persisting it would mean a *fixed* token still
     # couldn't poll again until someone noticed and hand-edited the state file.
     polling_disabled: bool = False
+    # Which of banter.py's line ids have been used in the current cycle, so a
+    # restart resumes the cycle instead of silently starting a fresh one every
+    # deploy -- see banter.next_banter for the cycle rule itself.
+    banter_used: frozenset[str] = dataclasses.field(default_factory=frozenset)
+    # The roster handle targeted by the most recent banter line, or None if that
+    # line targeted nobody (one of the six generic lines) or none has run yet.
+    # banter.next_banter needs this to enforce "never the same target twice in a
+    # row" across a restart, not just within one process's lifetime.
+    banter_last_target: str | None = None
 
 
 def _moment_to_json(moment: Moment) -> dict:
@@ -209,6 +218,27 @@ def prune_pending_greetings(raw: object, now: datetime.datetime) -> dict[str, st
     return pending
 
 
+def load_banter_state(raw_used: object, raw_last_target: object) -> tuple[frozenset[str], str | None]:
+    """Restore `banter_used`/`banter_last_target`, or start a fresh cycle.
+
+    Deliberately coarser than `prune_sent`'s per-entry salvage: banter is
+    decoration, and a genuinely corrupt pair (the wrong shape, a non-string id) is
+    not worth picking apart entry by entry the way a `sent` timestamp is -- the
+    worst case of resetting both together is one repeated line and one repeated
+    target sooner than the rules would otherwise allow, never a crash and never a
+    missed alert. `next_banter` also re-derives eligibility from `LINE_IDS`/the
+    roster on every call, so a used-id that no longer names a real line (a
+    previous deploy's line pool, edited by hand) is harmless left in -- it just
+    never matches anything in `eligible_lines()` and sits inert until the next
+    reset.
+    """
+    if not isinstance(raw_used, list) or not all(isinstance(x, str) for x in raw_used):
+        return frozenset(), None
+    if raw_last_target is not None and not isinstance(raw_last_target, str):
+        return frozenset(), None
+    return frozenset(raw_used), raw_last_target
+
+
 def load_state(path: pathlib.Path, now: datetime.datetime) -> State:
     try:
         raw = json.loads(path.read_text())
@@ -236,6 +266,9 @@ def load_state(path: pathlib.Path, now: datetime.datetime) -> State:
                 # Drop this source's cache only. The other source and the sent keys are
                 # still good, so a schema change costs a refetch, not a duplicate storm.
                 continue
+    banter_used, banter_last_target = load_banter_state(
+        raw.get("banter_used"), raw.get("banter_last_target")
+    )
     return State(
         sent=sent,
         cached=cached,
@@ -244,6 +277,8 @@ def load_state(path: pathlib.Path, now: datetime.datetime) -> State:
         pending_greetings=prune_pending_greetings(raw.get("pending_greetings"), now),
         # polling_disabled is deliberately not restored here -- see the field's own
         # comment on State. Every fresh load starts able to poll again.
+        banter_used=banter_used,
+        banter_last_target=banter_last_target,
     )
 
 
@@ -260,6 +295,10 @@ def save_state(path: pathlib.Path, state: State) -> None:
         "pending_greetings": state.pending_greetings,
         # polling_disabled is intentionally not written -- see the field's own
         # comment on State.
+        # Sorted for the same reason `greeted` is: JSON has no set type, and a
+        # stable on-disk order keeps the file's diffs sane across saves.
+        "banter_used": sorted(state.banter_used),
+        "banter_last_target": state.banter_last_target,
     }
     # Write and rename, so a crash mid-write leaves the previous file intact rather
     # than a truncated one. The temp sits in the same directory to keep the rename on

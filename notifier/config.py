@@ -12,6 +12,8 @@ import pathlib
 import zoneinfo
 from collections.abc import Mapping
 
+from notifier.banter import RosterMember, parse_roster
+
 
 class ConfigError(Exception):
     """Raised at startup when the environment cannot produce a usable Config."""
@@ -25,6 +27,11 @@ class Config:
     poll_seconds: float
     refresh_seconds: float
     state_path: pathlib.Path
+    # Defaulted, unlike everything above: both are optional configuration for a
+    # decoration on the alert, not the alert itself, so every existing direct
+    # `Config(...)` call site -- test or otherwise -- keeps working unchanged.
+    roster: tuple[RosterMember, ...] = ()
+    banter_enabled: bool = True
 
 
 def _required(env: Mapping[str, str], name: str) -> str:
@@ -49,6 +56,19 @@ def _seconds(env: Mapping[str, str], name: str, default: float) -> float:
         raise ConfigError(f"{name} must be a number, got {raw!r}") from exc
 
 
+def _banter_enabled(env: Mapping[str, str]) -> bool:
+    raw = env.get("NOTIFIER_BANTER", "").strip().lower()
+    if not raw or raw == "on":
+        return True
+    if raw == "off":
+        return False
+    # Unlike a malformed NOTIFIER_ROSTER entry (see parse_roster), this is not
+    # "other people's data" the operator cannot easily fix -- it is their own typo
+    # in a two-value switch, so it gets the same treatment as a bad NOTIFIER_TZ:
+    # named and refused rather than silently guessed at.
+    raise ConfigError(f"NOTIFIER_BANTER must be 'on' or 'off', got {raw!r}")
+
+
 def load_config(env: Mapping[str, str] | None = None) -> Config:
     env = os.environ if env is None else env
     tz_name = env.get("NOTIFIER_TZ", "").strip() or "Europe/London"
@@ -65,4 +85,9 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         state_path=pathlib.Path(
             env.get("NOTIFIER_STATE_PATH", "").strip() or "data/notifier_state.json"
         ),
+        # Other people's Telegram handles, not this repo's business to hardcode --
+        # see parse_roster's own docstring for why a bad entry is skipped rather
+        # than refused.
+        roster=parse_roster(env.get("NOTIFIER_ROSTER", "")),
+        banter_enabled=_banter_enabled(env),
     )

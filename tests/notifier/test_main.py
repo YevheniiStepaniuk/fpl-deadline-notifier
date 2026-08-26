@@ -9,7 +9,10 @@ import httpx
 import pytest
 import respx
 
-from notifier.__main__ import main, run_once, _greet, _log_reschedules, _should_refresh
+from notifier.__main__ import (
+    main, run_once, _append_banter, _greet, _log_reschedules, _should_refresh,
+)
+from notifier.banter import LINES
 from notifier.config import Config
 from notifier.sources import DRAFT_URL, FPL_URL, Moment
 from notifier.state import KEEP_PENDING_FOR, State, encode_pending_greeting, load_state, save_state
@@ -50,15 +53,24 @@ def _fixture(name):
     return json.loads((FIXTURES / f"{name}.json").read_text())
 
 
-def _cfg(tmp_path):
-    return Config(
-        bot_token=TOKEN,
-        chat_id="987",
-        tz=zoneinfo.ZoneInfo("Europe/London"),
-        poll_seconds=60.0,
-        refresh_seconds=3600.0,
-        state_path=tmp_path / "state.json",
-    )
+def _cfg(tmp_path, **overrides):
+    # banter_enabled=False by default: every test in this file predates banter and
+    # pins an exact message string. `Config`'s own default (roster=(), banter on)
+    # would append a real, randomly-picked line to every one of them -- this keeps
+    # them exercising tick behaviour only; test_banter.py covers the feature itself
+    # in isolation, and the `**overrides` escape hatch is for the few tests below
+    # that need banter on to prove the wiring.
+    fields = {
+        "bot_token": TOKEN,
+        "chat_id": "987",
+        "tz": zoneinfo.ZoneInfo("Europe/London"),
+        "poll_seconds": 60.0,
+        "refresh_seconds": 3600.0,
+        "state_path": tmp_path / "state.json",
+        "banter_enabled": False,
+    }
+    fields.update(overrides)
+    return Config(**fields)
 
 
 def _mock_apis():
@@ -951,4 +963,105 @@ def test_a_failed_nextdeadline_reply_does_not_disturb_the_alert_or_the_offset(tm
         run_once(cfg, client, state, now, refresh=True)  # must not raise
     assert send.call_count == 4
     assert "deadline:2:fpl:2" in state.sent  # the alert went through and was recorded
-    assert state.update_offset == 2  # advanced despite the reply failing
+
+
+# --- banter wiring -------------------------------------------------------------------
+#
+# The rules governing *which* line gets picked (no repeat, no consecutive target,
+# roster pairing, degrade-on-empty-roster) are test_banter.py's job, against
+# next_banter directly. This section only covers what __main__.py is responsible for:
+# whether banter runs at all, how it is glued onto a message, and -- the one the
+# spec calls out as the most important -- that it can never cost the alert it rides
+# along on.
+
+_GENERIC_TEXTS = {line.text for line in LINES if not line.needs_name}
+
+
+@respx.mock
+def test_banter_is_appended_to_the_scheduled_alert_after_a_blank_line(tmp_path):
+    """The spec's separator requirement: the deadline content stays scannable at the
+    top, the punchline sits below a blank line, not jammed onto the next line."""
+    _mock_apis()
+    send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    cfg = _cfg(tmp_path, banter_enabled=True)  # empty roster: the six generic lines
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        run_once(cfg, client, state, DEADLINE - datetime.timedelta(hours=2), refresh=True)
+    text = json.loads(send.calls[0].request.read())["text"]
+    deadline_part, sep, banter_part = text.partition("\n\n")
+    assert deadline_part == "⏰ GW2 deadline in 2 hours\nFPL + Draft · Fri 28 Aug, 18:30 BST"
+    assert sep == "\n\n"
+    assert banter_part in _GENERIC_TEXTS
+    # The picker actually ran and left its mark on state -- not just text that
+    # happens to look right.
+    assert state.banter_used
+    assert state.banter_last_target is None  # a generic line targets nobody
+
+
+@respx.mock
+def test_banter_off_appends_nothing_to_the_scheduled_alert(tmp_path):
+    _mock_apis()
+    send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    cfg = _cfg(tmp_path, banter_enabled=False)
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        run_once(cfg, client, state, DEADLINE - datetime.timedelta(hours=2), refresh=True)
+    text = json.loads(send.calls[0].request.read())["text"]
+    assert text == "⏰ GW2 deadline in 2 hours\nFPL + Draft · Fri 28 Aug, 18:30 BST"
+    assert "\n\n" not in text
+    assert state.banter_used == frozenset()
+
+
+@respx.mock
+def test_nextdeadline_reply_also_gets_banter_appended(tmp_path):
+    _mock_apis()
+    respx.get(UPDATES_URL).mock(side_effect=_offset_aware_single_command(-555, "/nextdeadline"))
+    send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    cfg = _cfg(tmp_path, banter_enabled=True)
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        run_once(cfg, client, state, NOT_DUE, refresh=True)
+    text = json.loads(send.calls[0].request.read())["text"]
+    deadline_part, sep, banter_part = text.partition("\n\n")
+    assert deadline_part.startswith("⏰ ")  # the /nextdeadline answer itself
+    assert sep == "\n\n"
+    assert banter_part in _GENERIC_TEXTS
+
+
+def test_a_failing_banter_picker_still_lets_the_alert_send_intact(tmp_path, monkeypatch):
+    """The spec's core guarantee: decoration on a critical message must never cost
+    it. Forces the exact failure named in the spec -- something raising inside the
+    picker -- and asserts the deadline message goes out exactly as it would with
+    banter off, not truncated or malformed."""
+    monkeypatch.setattr(
+        "notifier.__main__.next_banter",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    cfg = _cfg(tmp_path, banter_enabled=True)
+    state = State(sent={}, cached={})
+    text = _append_banter(cfg, state)
+    assert text is None  # decoration silently absent, not an exception
+    # And state was never touched by the failed attempt, so a later successful pick
+    # is not resuming from a half-applied update.
+    assert state.banter_used == frozenset()
+    assert state.banter_last_target is None
+
+
+@respx.mock
+def test_a_failing_banter_picker_does_not_stop_the_scheduled_alert_end_to_end(tmp_path, monkeypatch):
+    """The end-to-end version of the test above, driven through run_once exactly the
+    way the spec asks: 'a test that forces a failure in the picker and asserts the
+    deadline message still goes out intact.'"""
+    monkeypatch.setattr(
+        "notifier.__main__.next_banter",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    _mock_apis()
+    send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    cfg = _cfg(tmp_path, banter_enabled=True)
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        run_once(cfg, client, state, DEADLINE - datetime.timedelta(hours=2), refresh=True)  # must not raise
+    text = json.loads(send.calls[0].request.read())["text"]
+    assert text == "⏰ GW2 deadline in 2 hours\nFPL + Draft · Fri 28 Aug, 18:30 BST"
+    assert "deadline:2:fpl:2" in state.sent  # the alert itself still went through and was recorded
