@@ -195,3 +195,60 @@ def test_the_file_is_human_readable(tmp_path):
     text = path.read_text()
     assert "deadline:2:fpl:24" in text
     assert "\n" in text
+
+
+def test_a_fresh_state_defaults_the_new_fields_so_old_construction_still_works():
+    """Every existing call site builds State with just sent= and cached=; both new
+    fields need defaults or every one of those breaks."""
+    state = State(sent={}, cached={})
+    assert state.update_offset is None
+    assert state.greeted == set()
+
+
+def test_update_offset_and_greeted_round_trip(tmp_path):
+    path = tmp_path / "state.json"
+    save_state(path, State(sent={}, cached={}, update_offset=42, greeted={"987", "-100123"}))
+    restored = load_state(path, NOW)
+    assert restored.update_offset == 42
+    assert restored.greeted == {"987", "-100123"}
+
+
+def test_a_missing_file_defaults_the_new_fields_too(tmp_path):
+    state = load_state(tmp_path / "absent.json", NOW)
+    assert state.update_offset is None
+    assert state.greeted == set()
+
+
+def test_a_non_int_update_offset_degrades_to_none(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"sent": {}, "cached": {}, "update_offset": "not-an-int"}))
+    assert load_state(path, NOW).update_offset is None
+
+
+def test_a_boolean_update_offset_degrades_to_none(tmp_path):
+    """bool is an int subclass in Python; `true` surviving a hand edit must not become
+    offset 1 and silently drop update_id 0."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"sent": {}, "cached": {}, "update_offset": True}))
+    assert load_state(path, NOW).update_offset is None
+
+
+def test_a_non_list_greeted_degrades_to_empty_set(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"sent": {}, "cached": {}, "greeted": "987"}))
+    assert load_state(path, NOW).greeted == set()
+
+
+def test_non_string_entries_in_greeted_are_dropped(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"sent": {}, "cached": {}, "greeted": ["987", 42, None]}))
+    assert load_state(path, NOW).greeted == {"987"}
+
+
+def test_greeted_is_saved_as_a_sorted_list_not_a_set(tmp_path):
+    """JSON has no set type, so this has to be rebuilt as one on load -- and a stable
+    on-disk order keeps the file's diffs sane across saves."""
+    path = tmp_path / "state.json"
+    save_state(path, State(sent={}, cached={}, greeted={"987", "-100123", "555"}))
+    raw = json.loads(path.read_text())
+    assert raw["greeted"] == ["-100123", "555", "987"]

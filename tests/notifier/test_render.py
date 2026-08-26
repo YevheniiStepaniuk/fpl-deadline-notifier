@@ -1,7 +1,7 @@
 import datetime
 import zoneinfo
 
-from notifier.render import format_message
+from notifier.render import format_intro, format_message
 from notifier.schedule import Alert
 from notifier.sources import Moment
 
@@ -87,3 +87,42 @@ def test_an_empty_alert_list_renders_empty():
     """The loop must never call Telegram with this, but returning "" is a saner
     contract than raising from a formatter."""
     assert format_message([], LONDON) == ""
+
+
+def test_the_intro_names_the_chats_own_id_so_it_can_be_copied_into_env():
+    """The whole reason the intro exists: the chat id is not knowable beforehand, so
+    the message has to hand it back."""
+    text = format_intro(-100123, "News", GW2_DEADLINE, LONDON)
+    assert "-100123" in text
+    assert "TELEGRAM_CHAT_ID" in text
+
+
+def test_the_intro_names_the_next_deadline_using_the_same_time_format_as_alerts():
+    """Reuses format_message's own %Z formatting, so the intro and a real alert never
+    disagree about what 18:30 BST looks like."""
+    text = format_intro(-100123, "News", GW2_DEADLINE, LONDON)
+    assert "GW2" in text
+    assert "Fri 28 Aug, 18:30 BST" in text
+
+
+def test_the_intro_has_no_awkward_gap_when_there_is_no_next_deadline():
+    """Between seasons there may be no future deadline at all."""
+    text = format_intro(-100123, "News", None, LONDON)
+    assert "GW" not in text
+    assert "\n\n\n" not in text
+
+
+def test_the_intro_says_what_the_service_sends():
+    """Four alerts a gameweek: 24h and 2h before both the gameweek deadline and the
+    Draft waiver deadline."""
+    text = format_intro(-100123, "News", GW2_DEADLINE, LONDON)
+    assert "24 hours" in text
+    assert "2 hours" in text
+    assert "waiver" in text.lower()
+
+
+def test_the_intro_survives_a_chat_with_no_title():
+    """Telegram does not send a title for every chat type; the message must still
+    read sensibly with one missing."""
+    text = format_intro(42, None, None, LONDON)
+    assert "42" in text

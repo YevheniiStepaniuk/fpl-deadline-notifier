@@ -9,7 +9,7 @@ import httpx
 import pytest
 import respx
 
-from notifier.__main__ import main, run_once, _log_reschedules, _should_refresh
+from notifier.__main__ import main, run_once, _greet, _log_reschedules, _should_refresh
 from notifier.config import Config
 from notifier.sources import DRAFT_URL, FPL_URL, Moment
 from notifier.state import State, load_state, save_state
@@ -18,9 +18,32 @@ from notifier.telegram import api_url, send_message as real_send_message
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 TOKEN = "123:abc"
 SEND_URL = api_url(TOKEN)
+UPDATES_URL = api_url(TOKEN, "getUpdates")
 OK = {"ok": True, "result": {"message_id": 1}}
 
 DEADLINE = datetime.datetime(2026, 8, 28, 17, 30, tzinfo=datetime.UTC)
+
+
+def _added_update(update_id, chat_id, chat_type="channel", title=None):
+    chat = {"id": chat_id, "type": chat_type}
+    if title is not None:
+        chat["title"] = title
+    return {
+        "update_id": update_id,
+        "my_chat_member": {
+            "chat": chat,
+            "date": 1735689600,
+            "from": {"id": 1, "is_bot": False, "first_name": "Someone"},
+            "old_chat_member": {"user": {"id": 999, "is_bot": True}, "status": "left"},
+            "new_chat_member": {"user": {"id": 999, "is_bot": True}, "status": "member"},
+        },
+    }
+
+
+def _no_updates():
+    return respx.get(UPDATES_URL).mock(
+        return_value=httpx.Response(200, json={"ok": True, "result": []})
+    )
 
 
 def _fixture(name):
@@ -41,6 +64,11 @@ def _cfg(tmp_path):
 def _mock_apis():
     respx.get(FPL_URL).mock(return_value=httpx.Response(200, json=_fixture("fpl_bootstrap")))
     respx.get(DRAFT_URL).mock(return_value=httpx.Response(200, json=_fixture("draft_bootstrap")))
+    # Every existing test in this file predates _greet. Mocking an empty result here,
+    # rather than leaving getUpdates unmocked, keeps those tests exercising a clean
+    # "nothing to greet" path instead of incidentally relying on respx's own
+    # unmocked-route error being swallowed by _greet's isolation.
+    _no_updates()
 
 
 @respx.mock
@@ -128,6 +156,7 @@ def test_refresh_false_makes_no_api_calls(tmp_path):
     fpl = respx.get(FPL_URL).mock(return_value=httpx.Response(200, json=_fixture("fpl_bootstrap")))
     respx.get(DRAFT_URL).mock(return_value=httpx.Response(200, json=_fixture("draft_bootstrap")))
     respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    _no_updates()
     state = State(sent={}, cached={"fpl": [Moment("deadline", 2, DEADLINE, frozenset({"fpl"}))]})
     with httpx.Client() as client:
         run_once(_cfg(tmp_path), client, state, DEADLINE - datetime.timedelta(hours=2), refresh=False)
@@ -140,6 +169,7 @@ def test_one_source_failing_still_sends_the_other_from_cache(tmp_path):
     respx.get(FPL_URL).mock(return_value=httpx.Response(200, json=_fixture("fpl_bootstrap")))
     respx.get(DRAFT_URL).mock(return_value=httpx.Response(503))
     send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    _no_updates()
     state = State(sent={}, cached={"draft": [Moment("waivers", 2, DEADLINE, frozenset({"draft"}))]})
     with httpx.Client() as client:
         run_once(_cfg(tmp_path), client, state, DEADLINE - datetime.timedelta(hours=2), refresh=True)
@@ -156,6 +186,7 @@ def test_both_sources_failing_with_no_cache_is_not_fatal(tmp_path):
     """First run on a box with no network. Nothing to send, nothing lost, no crash."""
     respx.get(FPL_URL).mock(return_value=httpx.Response(503))
     respx.get(DRAFT_URL).mock(side_effect=httpx.ConnectError("no route"))
+    _no_updates()
     with httpx.Client() as client:
         run_once(_cfg(tmp_path), client, State(sent={}, cached={}),
                  DEADLINE - datetime.timedelta(hours=2), refresh=True)
@@ -317,3 +348,140 @@ def test_main_once_runs_a_single_tick_and_exits_zero(monkeypatch, tmp_path):
     monkeypatch.setenv("NOTIFIER_STATE_PATH", str(tmp_path / "state.json"))
     assert main(["--once"]) == 0
     assert (tmp_path / "state.json").exists()
+
+
+# --- _greet ------------------------------------------------------------------------
+
+NOT_DUE = DEADLINE - datetime.timedelta(days=30)
+
+
+@respx.mock
+def test_a_newly_added_chat_is_greeted_while_alerts_still_go_only_to_cfg_chat_id(tmp_path):
+    """The core guarantee of discovery: a channel adding the bot gets the intro, but
+    that must never redirect or multiply the deadline alerts themselves."""
+    _mock_apis()
+    respx.get(UPDATES_URL).mock(return_value=httpx.Response(200, json={
+        "ok": True, "result": [_added_update(1, -100999, title="News")],
+    }))
+    send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    cfg = _cfg(tmp_path)
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        run_once(cfg, client, state, NOT_DUE, refresh=True)
+    bodies = [json.loads(c.request.read()) for c in send.calls]
+    assert {b["chat_id"] for b in bodies} == {"-100999"}
+    assert state.greeted == {"-100999"}
+
+
+@respx.mock
+def test_a_chat_already_greeted_gets_no_second_intro(tmp_path):
+    _mock_apis()
+    respx.get(UPDATES_URL).mock(return_value=httpx.Response(200, json={
+        "ok": True, "result": [_added_update(1, -100999, title="News")],
+    }))
+    send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    cfg = _cfg(tmp_path)
+    state = State(sent={}, cached={}, greeted={"-100999"})
+    with httpx.Client() as client:
+        run_once(cfg, client, state, NOT_DUE, refresh=True)
+    assert send.call_count == 0
+
+
+@respx.mock
+def test_a_failed_greeting_is_not_recorded_so_the_next_tick_retries(tmp_path, monkeypatch):
+    """The same asymmetry `run_once` already uses for alerts: an unsent intro must be
+    retried, never silently written off as delivered."""
+    monkeypatch.setattr(
+        "notifier.__main__.send_message",
+        functools.partial(real_send_message, sleep=lambda _: None),
+    )
+    _mock_apis()
+    respx.get(UPDATES_URL).mock(return_value=httpx.Response(200, json={
+        "ok": True, "result": [_added_update(1, -100999)],
+    }))
+    respx.post(SEND_URL).mock(return_value=httpx.Response(500))
+    cfg = _cfg(tmp_path)
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        run_once(cfg, client, state, NOT_DUE, refresh=True)
+    assert "-100999" not in state.greeted
+
+
+@respx.mock
+def test_updates_are_polled_on_a_non_refreshing_tick(tmp_path):
+    """`_refresh` is hourly by design, but getUpdates is Telegram's own endpoint and
+    the entire reason short-polling was chosen over a webhook. Gating it on the hourly
+    refresh would mean up to an hour of latency for something meant to stay live."""
+    updates = respx.get(UPDATES_URL).mock(
+        return_value=httpx.Response(200, json={"ok": True, "result": []})
+    )
+    respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    with httpx.Client() as client:
+        run_once(_cfg(tmp_path), client, State(sent={}, cached={}), NOT_DUE, refresh=False)
+    assert updates.call_count == 1
+
+
+@respx.mock
+def test_a_getupdates_outage_does_not_stop_a_deadline_alert(tmp_path):
+    """Isolation is the point: a Telegram polling failure must never take a real
+    deadline alert down with it, exactly as a Draft outage must not suppress FPL's."""
+    _mock_apis()
+    respx.get(UPDATES_URL).mock(return_value=httpx.Response(401, json={"ok": False}))
+    send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    cfg = _cfg(tmp_path)
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        run_once(cfg, client, state, DEADLINE - datetime.timedelta(hours=2), refresh=True)
+    assert send.call_count == 1
+    assert json.loads(send.calls[0].request.read())["chat_id"] == "987"
+
+
+def test_greet_picks_the_earliest_future_deadline_for_the_intro(tmp_path):
+    """A past deadline must not be offered as "next", and among several future ones the
+    soonest is the one worth naming."""
+    cfg = _cfg(tmp_path)
+    moments = [
+        Moment("deadline", 1, DEADLINE - datetime.timedelta(days=10), frozenset({"fpl"})),
+        Moment("deadline", 3, DEADLINE + datetime.timedelta(days=7), frozenset({"fpl"})),
+        Moment("deadline", 2, DEADLINE, frozenset({"fpl"})),
+    ]
+    state = State(sent={}, cached={})
+    with respx.mock:
+        respx.get(UPDATES_URL).mock(return_value=httpx.Response(200, json={
+            "ok": True, "result": [_added_update(1, -100999)],
+        }))
+        send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+        with httpx.Client() as client:
+            changed = _greet(cfg, client, state, moments, DEADLINE - datetime.timedelta(hours=2))
+    assert changed is True
+    text = json.loads(send.calls[0].request.read())["text"]
+    assert "GW2" in text
+    assert "GW1" not in text
+    assert "GW3" not in text
+
+
+def test_greet_advances_the_offset_even_with_nothing_to_greet(tmp_path):
+    """The offset has to move forward on an empty-but-successful poll too, or the same
+    already-seen updates (a promotion, a demotion) would be re-fetched every tick
+    forever."""
+    cfg = _cfg(tmp_path)
+    state = State(sent={}, cached={})
+    with respx.mock:
+        respx.get(UPDATES_URL).mock(return_value=httpx.Response(200, json={
+            "ok": True, "result": [
+                # A promotion: a real my_chat_member update, but not an add.
+                {
+                    "update_id": 5,
+                    "my_chat_member": {
+                        "chat": {"id": -1, "type": "channel"},
+                        "old_chat_member": {"status": "member"},
+                        "new_chat_member": {"status": "administrator"},
+                    },
+                },
+            ],
+        }))
+        with httpx.Client() as client:
+            changed = _greet(cfg, client, state, [], DEADLINE)
+    assert changed is True
+    assert state.update_offset == 6
+    assert state.greeted == set()

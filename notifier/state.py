@@ -32,6 +32,14 @@ class State:
     # to its own cached half while the other stays fresh. Splitting a merged list back
     # apart would mean guessing which game contributed which moment.
     cached: dict[str, list[Moment]]
+    # The next getUpdates offset. None until the first successful poll, matching
+    # Telegram's own "omit it" convention for a fresh bot with nothing to confirm yet.
+    update_offset: int | None = None
+    # Chats already sent the one-time intro, keyed by str(chat_id). Never pruned like
+    # `sent` is: a chat greeted once should stay greeted for the life of the bot, not
+    # just for KEEP_SENT_FOR -- there is no future event that makes greeting it again
+    # correct.
+    greeted: set[str] = dataclasses.field(default_factory=set)
 
 
 def _moment_to_json(moment: Moment) -> dict:
@@ -87,6 +95,20 @@ def prune_sent(raw_sent: object, now: datetime.datetime) -> dict[str, str]:
     return pruned
 
 
+def _load_update_offset(raw: object) -> int | None:
+    # bool is an int subclass; a stray `true` surviving a hand edit must not become
+    # offset 1 and silently drop update_id 0.
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return raw
+    return None
+
+
+def _load_greeted(raw: object) -> set[str]:
+    if not isinstance(raw, list):
+        return set()
+    return {item for item in raw if isinstance(item, str)}
+
+
 def load_state(path: pathlib.Path, now: datetime.datetime) -> State:
     try:
         raw = json.loads(path.read_text())
@@ -114,7 +136,12 @@ def load_state(path: pathlib.Path, now: datetime.datetime) -> State:
                 # Drop this source's cache only. The other source and the sent keys are
                 # still good, so a schema change costs a refetch, not a duplicate storm.
                 continue
-    return State(sent=sent, cached=cached)
+    return State(
+        sent=sent,
+        cached=cached,
+        update_offset=_load_update_offset(raw.get("update_offset")),
+        greeted=_load_greeted(raw.get("greeted")),
+    )
 
 
 def save_state(path: pathlib.Path, state: State) -> None:
@@ -125,6 +152,8 @@ def save_state(path: pathlib.Path, state: State) -> None:
             game: [_moment_to_json(m) for m in moments]
             for game, moments in state.cached.items()
         },
+        "update_offset": state.update_offset,
+        "greeted": sorted(state.greeted),
     }
     # Write and rename, so a crash mid-write leaves the previous file intact rather
     # than a truncated one. The temp sits in the same directory to keep the rename on

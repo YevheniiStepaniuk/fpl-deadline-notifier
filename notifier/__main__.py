@@ -25,11 +25,12 @@ import httpx
 # fails only when both test modules run together, which is the worst way to find out.
 # Resolving through the module object looks the name up at call time instead.
 from notifier import config, sources
-from notifier.render import format_message
+from notifier.render import format_intro, format_message
 from notifier.schedule import Alert, due_alerts
 from notifier.sources import Moment
 from notifier.state import KEEP_SENT_FOR, State, load_state, prune_sent, save_state
 from notifier.telegram import TelegramError, send_message
+from notifier.updates import fetch_added
 
 log = logging.getLogger("notifier")
 
@@ -103,6 +104,70 @@ def _record(state: State, alerts: Iterable[Alert]) -> None:
             state.sent[key] = stamp
 
 
+def _next_deadline(moments: Iterable[Moment], now: datetime.datetime) -> Moment | None:
+    upcoming = [m for m in moments if m.kind == "deadline" and m.when > now]
+    return min(upcoming, key=lambda m: m.when, default=None)
+
+
+def _greet(
+    cfg: config.Config,
+    client: httpx.Client,
+    state: State,
+    moments: Iterable[Moment],
+    now: datetime.datetime,
+) -> bool:
+    """Poll once for chats that just added the bot, and send each a one-time intro.
+
+    Runs on every tick rather than only on a refreshing one: `_refresh`'s hourly
+    cadence exists to be polite to two APIs this service does not control, but
+    getUpdates is Telegram's own endpoint and the whole reason it was chosen over a
+    webhook was to stay responsive without a second thread. Gating it on the hourly
+    refresh would mean an intro arriving up to an hour after someone adds the bot.
+
+    Only fetch_added's network call is isolated here, the same shape as `_refresh`'s
+    per-source try/except: this is a convenience bolted beside the thing that
+    matters, and a webhook conflict, a network blip or a malformed update must never
+    stop a deadline alert on the same tick. A per-chat send failure is handled
+    separately below, for the same reason `run_once` does not let one failed alert
+    stop another.
+    """
+    try:
+        added, highest = fetch_added(client, cfg.bot_token, state.update_offset)
+    except Exception as exc:
+        log.warning("polling for chat updates failed (%s); will retry next tick", exc)
+        return False
+
+    changed = False
+    if highest is not None:
+        # +1, not `highest` itself: Telegram treats the offset as "give me updates
+        # after this id", so sending `highest` back would redeliver it forever. Get
+        # this wrong the other way (highest + 2) and an update silently never arrives.
+        state.update_offset = highest + 1
+        changed = True
+
+    if not added:
+        return changed
+
+    next_deadline = _next_deadline(moments, now)
+    for chat in added:
+        key = str(chat.chat_id)
+        if key in state.greeted:
+            continue
+        text = format_intro(chat.chat_id, chat.title, next_deadline, cfg.tz)
+        try:
+            send_message(client, cfg.bot_token, key, text)
+        except TelegramError as exc:
+            # Not recorded, so the next tick retries -- the same asymmetry `run_once`
+            # already uses for alerts: a chat that never sees the intro is worse than
+            # one that sees it twice.
+            log.error("intro to chat %s failed, will retry next tick: %s", key, exc)
+            continue
+        log.info("greeted new chat %s (%s)", key, chat.chat_type)
+        state.greeted.add(key)
+        changed = True
+    return changed
+
+
 def run_once(
     cfg: config.Config,
     client: httpx.Client,
@@ -150,7 +215,9 @@ def run_once(
             # not re-fire the half whose key was never written.
             _record(state, to_send)
 
-    if to_send or to_retire or refresh:
+    greeted = _greet(cfg, client, state, moments, now)
+
+    if to_send or to_retire or refresh or greeted:
         try:
             save_state(cfg.state_path, state)
         except OSError as exc:

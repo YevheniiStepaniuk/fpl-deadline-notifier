@@ -26,10 +26,11 @@ class TelegramError(Exception):
     """Raised when a message could not be delivered. State must not be written."""
 
 
-def api_url(token: str) -> str:
+def api_url(token: str, method: str = "sendMessage") -> str:
     # Path, not query string: a token in a query string lands in every proxy log on
-    # the way.
-    return f"https://api.telegram.org/bot{token}/sendMessage"
+    # the way. Applies equally to getUpdates, which is why `method` is a parameter
+    # here rather than a second near-identical function.
+    return f"https://api.telegram.org/bot{token}/{method}"
 
 
 def _describe(response: httpx.Response) -> str:
