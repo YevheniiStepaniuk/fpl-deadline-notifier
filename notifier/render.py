@@ -109,11 +109,15 @@ def _format_delta(delta: datetime.timedelta) -> str:
     time is whatever it actually is; reusing the canned offset here would be wrong
     almost every time it was shown.
 
-    Rounds down to the coarsest whole unit worth naming (hours+minutes, then minutes,
-    then seconds) rather than showing every unit down to the second once the gap is
-    large -- "in 9 hours 12 minutes" is useful, "in 9 hours 12 minutes 47 seconds" is
-    not. Flooring rather than rounding to the nearest unit is the safe direction for a
-    countdown: it never claims less time is left than there actually is.
+    Rounds down to the coarsest whole unit worth naming (days+hours, then
+    hours+minutes, then minutes, then seconds) rather than showing every unit down to
+    the second once the gap is large -- "in 9 hours 12 minutes" is useful, "in 9 hours
+    12 minutes 47 seconds" is not. Below the day tier this was already true; the day
+    tier itself exists because most of any week sits above the old ceiling -- once a
+    deadline passes, the next one is commonly 5-6 days out, and "in 143 hours 59
+    minutes" is unreadable in a way "in 5 days 23 hours" is not. Flooring rather than
+    rounding to the nearest unit is the safe direction for a countdown: it never
+    claims less time is left than there actually is.
     """
     seconds = max(int(delta.total_seconds()), 0)
     if seconds == 0:
@@ -121,8 +125,14 @@ def _format_delta(delta: datetime.timedelta) -> str:
         # reads like a typo, and not negative, which `max(..., 0)` above already rules
         # out for a moment that has technically just passed by the time this runs.
         return "right now"
+    days, seconds = divmod(seconds, 86400)
     hours, seconds = divmod(seconds, 3600)
     minutes, seconds = divmod(seconds, 60)
+    if days:
+        parts = [_plural(days, "day")]
+        if hours:
+            parts.append(_plural(hours, "hour"))
+        return "in " + " ".join(parts)
     if hours:
         parts = [_plural(hours, "hour")]
         if minutes:

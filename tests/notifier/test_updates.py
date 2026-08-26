@@ -214,11 +214,15 @@ def test_restricted_to_member_is_not_a_second_add_once_already_present():
 
 
 @respx.mock
-def test_fetch_updates_requests_both_membership_and_message_updates():
-    """allowed_updates now covers both update types this service reads -- adds via
-    my_chat_member, commands via message -- so getUpdates queues nothing else. Privacy
-    mode is what keeps "message" from also handing over ordinary group chatter; see
-    the module docstring."""
+def test_fetch_updates_requests_every_update_type_this_service_reads():
+    """allowed_updates now covers all three update types this service reads -- adds
+    via my_chat_member, commands via message or channel_post -- so getUpdates queues
+    nothing else. Privacy mode is what keeps "message" from also handing over
+    ordinary group chatter; see the module docstring. "channel_post" is not a
+    redundant duplicate of "message": Telegram delivers a channel's posts under this
+    separate key even though the payload shape is identical (see ALLOWED_UPDATES'
+    own comment) -- without it, /nextdeadline silently never reaches the bot in a
+    channel."""
     route = respx.get(UPDATES_URL).mock(
         return_value=httpx.Response(200, json={"ok": True, "result": []})
     )
@@ -227,6 +231,7 @@ def test_fetch_updates_requests_both_membership_and_message_updates():
     request = route.calls[0].request
     assert "my_chat_member" in str(request.url)
     assert "message" in str(request.url)
+    assert "channel_post" in str(request.url)
     assert "timeout=0" in str(request.url)
     assert "offset" not in str(request.url)
 
@@ -340,11 +345,43 @@ def _message(update_id, chat_id, text, chat_type="group"):
     }
 
 
+def _channel_post(update_id, chat_id, text):
+    # Same `Message` shape as `_message` (confirmed against the Bot API docs: both
+    # `message` and `channel_post` are typed as `Message`, with identical `chat` and
+    # `text` fields) -- only the top-level key and `chat.type` differ.
+    return {
+        "update_id": update_id,
+        "channel_post": {
+            "message_id": 1,
+            "date": 1735689600,
+            "chat": {"id": chat_id, "type": "channel"},
+            "text": text,
+        },
+    }
+
+
 def test_the_plain_command_triggers():
     payload = {"ok": True, "result": [_message(1, -200, "/nextdeadline")]}
     commands, highest = parse_commands(payload)
     assert commands == [Command(chat_id=-200, name="nextdeadline")]
     assert highest == 1
+
+
+def test_a_command_posted_in_a_channel_also_triggers():
+    """A command sent in a channel arrives under "channel_post", not "message" --
+    without also reading that key, /nextdeadline would work in every chat type
+    except the one the intro's "channels are a real case" comments already treat as
+    real (see ChatAdded's chat_type comment)."""
+    payload = {"ok": True, "result": [_channel_post(1, -100555, "/nextdeadline")]}
+    commands, highest = parse_commands(payload)
+    assert commands == [Command(chat_id=-100555, name="nextdeadline")]
+    assert highest == 1
+
+
+def test_a_channel_post_lookalike_message_does_not_trigger():
+    payload = {"ok": True, "result": [_channel_post(1, -100555, "please run /nextdeadline later")]}
+    commands, _ = parse_commands(payload)
+    assert commands == []
 
 
 def test_the_bot_suffixed_command_triggers():

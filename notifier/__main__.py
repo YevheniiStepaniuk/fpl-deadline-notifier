@@ -125,12 +125,12 @@ def _record(state: State, alerts: Iterable[Alert]) -> None:
             state.sent[key] = stamp
 
 
-def _next_deadline(moments: Iterable[Moment], now: datetime.datetime) -> Moment | None:
+def _next_deadline(moments: Sequence[Moment], now: datetime.datetime) -> Moment | None:
     upcoming = [m for m in moments if m.kind == "deadline" and m.when > now]
     return min(upcoming, key=lambda m: m.when, default=None)
 
 
-def _next_moment(moments: Iterable[Moment], now: datetime.datetime) -> Moment | None:
+def _next_moment(moments: Sequence[Moment], now: datetime.datetime) -> Moment | None:
     """The earliest still-future moment of *either* kind, for /nextdeadline.
 
     Deliberately not `_next_deadline`: that one only ever offers a gameweek deadline,
@@ -138,6 +138,11 @@ def _next_moment(moments: Iterable[Moment], now: datetime.datetime) -> Moment | 
     strange thing to greet someone with), but wrong for someone asking "what's next" --
     a Draft waiver window closing in two hours is more next than a deadline four days
     away, and the reply should say so.
+
+    `Sequence`, not `Iterable`: both this and `_next_deadline` get called more than
+    once per tick against the same `moments` -- once for the intro, once per command
+    in `_poll_and_greet`'s reply loop -- and a one-shot iterator would silently answer
+    "Nothing on the horizon" for every call after the first.
     """
     upcoming = [m for m in moments if m.when > now]
     return min(upcoming, key=lambda m: m.when, default=None)
@@ -147,7 +152,7 @@ def _greet(
     cfg: config.Config,
     client: httpx.Client,
     state: State,
-    moments: Iterable[Moment],
+    moments: Sequence[Moment],
     now: datetime.datetime,
     refresh: bool,
 ) -> bool:
@@ -172,7 +177,7 @@ def _poll_and_greet(
     cfg: config.Config,
     client: httpx.Client,
     state: State,
-    moments: Iterable[Moment],
+    moments: Sequence[Moment],
     now: datetime.datetime,
     refresh: bool,
 ) -> bool:

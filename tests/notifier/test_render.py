@@ -181,6 +181,52 @@ def test_format_next_singular_units_are_not_pluralised():
     assert "in 1 second\n" in format_next(GW2_DEADLINE, DEADLINE - datetime.timedelta(seconds=1), LONDON)
 
 
+def test_format_next_names_days_for_a_gap_of_a_week_or_so():
+    """The common case, not an edge case: once a deadline passes, the next one is
+    typically 5-6 days out, which is where format_next used to sit for most of any
+    week before the day tier existed -- "in 143 hours 59 minutes" was unreadable, and
+    this is what replaced it."""
+    now = DEADLINE - datetime.timedelta(days=5, hours=23)
+    text = format_next(GW2_DEADLINE, now, LONDON)
+    assert text == "⏰ GW2 deadline in 5 days 23 hours\nFPL + Draft · Fri 28 Aug, 18:30 BST"
+
+
+def test_format_next_drops_the_hours_component_when_it_rounds_to_zero():
+    """Exactly 2 days out (or any exact multiple of 24h) must read "in 2 days", not
+    "in 2 days 0 hours" -- the same zero-suppression the hours/minutes tier already
+    had, extended to the new tier above it."""
+    text = format_next(GW2_DEADLINE, DEADLINE - datetime.timedelta(hours=48), LONDON)
+    assert "in 2 days" in text
+    assert "0 hour" not in text
+
+
+def test_format_next_at_exactly_24_hours_says_1_day():
+    """The boundary the spec calls out by name: at precisely T-24h, this used to
+    print "in 24 hours" (and coincidentally matched the scheduled alert's own
+    wording, which is the old anchor `test_format_next_does_not_reuse_the_scheduled_
+    alerts_wording` used before this test existed) -- now it must say "in 1 day", not
+    "in 24 hours" and not "in 1 day 0 hours"."""
+    text = format_next(GW2_DEADLINE, DEADLINE - datetime.timedelta(hours=24), LONDON)
+    assert "in 1 day" in text
+    assert "24 hours" not in text
+    assert "0 hour" not in text
+
+
+def test_format_next_just_under_24_hours_still_says_hours_not_a_day():
+    """One minute below the day boundary must still use the hours+minutes tier --
+    pins the boundary from the other side of the test above."""
+    text = format_next(GW2_DEADLINE, DEADLINE - datetime.timedelta(hours=23, minutes=59), LONDON)
+    assert "in 23 hours 59 minutes" in text
+    assert "day" not in text
+
+
+def test_format_next_a_day_and_some_hours_out():
+    """The two-unit shape above the day tier: days + hours, singular "day" for the
+    first unit and plural "hours" for the second."""
+    text = format_next(GW2_DEADLINE, DEADLINE - datetime.timedelta(days=1, hours=2), LONDON)
+    assert "in 1 day 2 hours" in text
+
+
 def test_format_next_on_the_exact_boundary_says_right_now():
     """now == moment.when is the awkward case the spec calls out by name: "in 0
     seconds" would read like a typo, and a naive computation could even go negative."""
@@ -208,10 +254,14 @@ def test_format_next_with_no_upcoming_moment_is_pleasant():
 def test_format_next_does_not_reuse_the_scheduled_alerts_wording():
     """The spec's explicit requirement: the on-demand reply must never say "in 24
     hours" or "in 2 hours" the way a scheduled alert does, since those are only true
-    the instant an alert fires exactly on its trigger."""
-    now = DEADLINE - datetime.timedelta(hours=24)
+    the instant an alert fires exactly on its trigger. Anchored on the 2-hour offset,
+    not the 24-hour one: since the day tier was added, T-24h now floors to "1 day"
+    (see test_format_next_at_exactly_24_hours_says_1_day), so it can no longer stand
+    in for the "coincidentally matches, but only this once" case -- the 2-hour offset
+    still can, because it never crosses the day boundary."""
+    now = DEADLINE - datetime.timedelta(hours=2)
     text = format_next(GW2_DEADLINE, now, LONDON)
-    assert "in 24 hours" in text  # coincidentally true this once, at exactly T-24h ...
-    now = DEADLINE - datetime.timedelta(hours=23, minutes=59)
+    assert "in 2 hours" in text  # coincidentally true this once, at exactly T-2h ...
+    now = DEADLINE - datetime.timedelta(hours=1, minutes=59)
     text = format_next(GW2_DEADLINE, now, LONDON)
-    assert "in 24 hours" not in text  # ... but false one minute later, unlike format_message
+    assert "in 2 hours" not in text  # ... but false one minute later, unlike format_message

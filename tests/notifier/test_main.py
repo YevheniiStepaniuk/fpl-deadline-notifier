@@ -837,6 +837,50 @@ def test_nextdeadline_with_a_bot_username_suffix_also_triggers(tmp_path):
     assert send.call_count == 1
 
 
+def _channel_post_command_update(update_id, chat_id, text):
+    # Same shape as _command_update, but under "channel_post" -- what a command
+    # posted directly in a channel (rather than a group or DM) arrives as.
+    return {
+        "update_id": update_id,
+        "channel_post": {
+            "message_id": 1,
+            "date": 1735689600,
+            "chat": {"id": chat_id, "type": "channel"},
+            "text": text,
+        },
+    }
+
+
+def _offset_aware_single_channel_post(chat_id, text):
+    update = _channel_post_command_update(1, chat_id, text)
+
+    def handler(request):
+        if request.url.params.get("offset") is None:
+            return httpx.Response(200, json={"ok": True, "result": [update]})
+        return httpx.Response(200, json={"ok": True, "result": []})
+
+    return handler
+
+
+@respx.mock
+def test_nextdeadline_posted_in_a_channel_also_triggers(tmp_path):
+    """A command sent directly in a channel arrives as "channel_post", not
+    "message" -- the intro's own text ("channels are a real case", per ChatAdded's
+    chat_type comment) promises /nextdeadline works anywhere the bot is, and this is
+    what makes that true in a channel too, not just a group or DM."""
+    _mock_apis()
+    respx.get(UPDATES_URL).mock(
+        side_effect=_offset_aware_single_channel_post(-100777, "/nextdeadline")
+    )
+    send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    cfg = _cfg(tmp_path)
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        run_once(cfg, client, state, NOT_DUE, refresh=True)
+    bodies = [json.loads(c.request.read()) for c in send.calls]
+    assert {b["chat_id"] for b in bodies} == {"-100777"}
+
+
 @respx.mock
 def test_a_lookalike_message_does_not_trigger_a_reply(tmp_path):
     """A message that merely mentions the command must not fire it -- see

@@ -20,14 +20,23 @@ from notifier.telegram import api_url
 TIMEOUT = 15.0
 
 # Passed as `allowed_updates` to getUpdates so Telegram queues only what this service
-# ever looks at: membership changes, and messages (for slash commands). Without this,
-# an ordinary channel post would sit in the update backlog for a service that has no
-# code path that ever reads it -- growing forever and eventually forcing an offset
-# jump just to clear it. Adding "message" does not open the floodgates to normal group
-# chatter: bot privacy mode is on by default (and this bot has never disabled it), so
-# in a group Telegram hands the bot only messages that are commands or that @-mention
-# it -- everyone else's conversation is invisible to it regardless of allowed_updates.
-ALLOWED_UPDATES = ["my_chat_member", "message"]
+# ever looks at: membership changes, and commands (from both "message" and
+# "channel_post"). Without this, an ordinary channel post would sit in the update
+# backlog for a service that has no code path that ever reads it -- growing forever
+# and eventually forcing an offset jump just to clear it. Adding "message" does not
+# open the floodgates to normal group chatter: bot privacy mode is on by default (and
+# this bot has never disabled it), so in a group Telegram hands the bot only messages
+# that are commands or that @-mention it -- everyone else's conversation is invisible
+# to it regardless of allowed_updates.
+#
+# "message" and "channel_post" are both required, not a redundant pair: Telegram puts
+# a command sent in a group or DM under "message" but a command posted in a channel
+# under "channel_post" -- same `Message` shape (`chat`, `text`, etc. are identical
+# fields per the Bot API docs), just a different top-level key on the Update object.
+# Dropping either one would silently stop /nextdeadline from working in that kind of
+# chat while every other chat kept working, which is an easy thing for a future edit
+# to do by mistake if this looked like it needed only one.
+ALLOWED_UPDATES = ["my_chat_member", "message", "channel_post"]
 
 # `/command` or `/command@some_bot`, matched at the very start of the (whitespace-
 # trimmed) text and only there -- "please run /nextdeadline" must not trigger, since
@@ -209,7 +218,14 @@ def parse_commands(payload: dict) -> tuple[list[Command], int | None]:
         if isinstance(update_id, int) and not isinstance(update_id, bool):
             highest = update_id if highest is None else max(highest, update_id)
 
+        # A command can arrive under either key -- see ALLOWED_UPDATES' own comment
+        # on why both are requested. Both are `Message` objects with an identical
+        # shape (per the Bot API docs), so reading whichever one is actually present
+        # is correct rather than a shortcut: there is nothing channel_post-specific
+        # left to handle once this line picks it up.
         message = update.get("message")
+        if not isinstance(message, dict):
+            message = update.get("channel_post")
         if not isinstance(message, dict):
             continue
         chat = message.get("chat")
