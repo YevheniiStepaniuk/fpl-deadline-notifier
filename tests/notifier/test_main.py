@@ -12,7 +12,7 @@ import respx
 from notifier.__main__ import main, run_once, _greet, _log_reschedules, _should_refresh
 from notifier.config import Config
 from notifier.sources import DRAFT_URL, FPL_URL, Moment
-from notifier.state import State, load_state, save_state
+from notifier.state import State, encode_pending_greeting, load_state, save_state
 from notifier.telegram import api_url, send_message as real_send_message
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
@@ -400,6 +400,11 @@ def test_a_failed_greeting_is_not_lost_when_the_offset_has_already_moved_on(tmp_
     tick 2's poll returns nothing new. This only passes if retrying a pending
     greeting is independent of the offset -- i.e. if `state.pending_greetings` (not
     another poll) is what tick 2 retries from.
+
+    Tick 1 does not refresh: the *first* attempt at a brand-new add always happens
+    regardless of `refresh`, which is what keeps discovery latency low. Tick 2 does
+    refresh, since a *retry* of an already-pending chat only happens on a refreshing
+    tick -- see finding A part 3. Both are deliberate, not incidental to this test.
     """
     monkeypatch.setattr(
         "notifier.__main__.send_message",
@@ -420,10 +425,10 @@ def test_a_failed_greeting_is_not_lost_when_the_offset_has_already_moved_on(tmp_
     cfg = _cfg(tmp_path)
     state = State(sent={}, cached={})
     with httpx.Client() as client:
-        run_once(cfg, client, state, NOT_DUE, refresh=False)
+        run_once(cfg, client, state, NOT_DUE, refresh=False)  # discovery: not gated
         assert "-100999" not in state.greeted
         assert "-100999" in state.pending_greetings  # the retry record survives tick 1
-        run_once(cfg, client, state, NOT_DUE, refresh=False)
+        run_once(cfg, client, state, NOT_DUE, refresh=True)  # retry: needs refresh=True
     assert "-100999" in state.greeted
     assert "-100999" not in state.pending_greetings
     assert send.call_count == 4
@@ -474,7 +479,9 @@ def test_greet_picks_the_earliest_future_deadline_for_the_intro(tmp_path):
         }))
         send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
         with httpx.Client() as client:
-            changed = _greet(cfg, client, state, moments, DEADLINE - datetime.timedelta(hours=2))
+            changed = _greet(
+                cfg, client, state, moments, DEADLINE - datetime.timedelta(hours=2), True,
+            )
     assert changed is True
     text = json.loads(send.calls[0].request.read())["text"]
     assert "GW2" in text
@@ -503,7 +510,7 @@ def test_greet_advances_the_offset_even_with_nothing_to_greet(tmp_path):
             ],
         }))
         with httpx.Client() as client:
-            changed = _greet(cfg, client, state, [], DEADLINE)
+            changed = _greet(cfg, client, state, [], DEADLINE, True)
     assert changed is True
     assert state.update_offset == 6
     assert state.greeted == set()
@@ -551,3 +558,130 @@ def test_an_unexpected_exception_anywhere_in_greet_does_not_escape_run_once(tmp_
     with httpx.Client() as client:
         run_once(cfg, client, state, NOT_DUE, refresh=False)  # must not raise
     assert "-100999" not in state.greeted  # the crashed attempt was not recorded either
+
+
+# --- fix round 2: pending-greeting retry pathology ----------------------------------
+
+
+def _offset_aware_single_add(chat_id, title=None):
+    """A getUpdates handler that reports one add on the first (offsetless) poll and
+    nothing on any later one -- the same fake used to catch finding 1, reused here so
+    multi-tick tests do not accidentally rediscover the same chat every tick."""
+    added_update = _added_update(1, chat_id, title=title)
+
+    def handler(request):
+        if request.url.params.get("offset") is None:
+            return httpx.Response(200, json={"ok": True, "result": [added_update]})
+        return httpx.Response(200, json={"ok": True, "result": []})
+
+    return handler
+
+
+@respx.mock
+def test_a_permanently_rejected_chat_is_dropped_not_retried_forever(tmp_path):
+    """NEW FINDING A, part 1. A 403 (bot blocked/kicked) or 400 (bad chat) is not
+    going to become deliverable by being retried -- that is exactly the pathology
+    `PermanentPollError` was introduced to remove from the poll side, reappearing on
+    the send side. Probed before this fix: five ticks, five attempts, the entry still
+    sitting in `pending_greetings` at the end -- one request and one log line every
+    tick, forever."""
+    respx.get(UPDATES_URL).mock(side_effect=_offset_aware_single_add(-100999))
+    send = respx.post(SEND_URL).mock(return_value=httpx.Response(
+        403, json={"ok": False, "description": "Forbidden: bot was blocked by the user"}
+    ))
+    cfg = _cfg(tmp_path)
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        run_once(cfg, client, state, NOT_DUE, refresh=False)
+        assert "-100999" not in state.pending_greetings
+        assert "-100999" not in state.greeted
+        # Two more refreshing ticks -- a retry *would* be attempted here if the entry
+        # were still pending. It must not be, so no further requests happen.
+        run_once(cfg, client, state, NOT_DUE, refresh=True)
+        run_once(cfg, client, state, NOT_DUE, refresh=True)
+    assert send.call_count == 1
+
+
+@respx.mock
+def test_a_transient_send_failure_keeps_the_entry_pending(tmp_path, monkeypatch):
+    """Contrast with the permanent case above: running out of attempts against a 500
+    is not the same as Telegram saying no, and must not drop the chat."""
+    monkeypatch.setattr(
+        "notifier.__main__.send_message",
+        functools.partial(real_send_message, sleep=lambda _: None),
+    )
+    respx.get(UPDATES_URL).mock(side_effect=_offset_aware_single_add(-100999))
+    respx.post(SEND_URL).mock(return_value=httpx.Response(500))
+    cfg = _cfg(tmp_path)
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        run_once(cfg, client, state, NOT_DUE, refresh=False)
+    assert "-100999" in state.pending_greetings
+    assert "-100999" not in state.greeted
+
+
+@respx.mock
+def test_a_new_add_is_still_greeted_on_a_non_refreshing_tick(tmp_path):
+    """NEW FINDING A, part 3, the half that must not regress: discovery latency is the
+    whole reason polling runs every tick, so a brand-new add must not wait for the
+    hourly refresh the way a retry now does."""
+    respx.get(UPDATES_URL).mock(side_effect=_offset_aware_single_add(-100999))
+    send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    cfg = _cfg(tmp_path)
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        run_once(cfg, client, state, NOT_DUE, refresh=False)
+    assert send.call_count == 1
+    assert "-100999" in state.greeted
+
+
+@respx.mock
+def test_a_pending_retry_is_attempted_only_when_refresh_is_true(tmp_path, monkeypatch):
+    """NEW FINDING A, part 3: a chat already waiting from an earlier tick is not
+    latency-sensitive the way a fresh discovery is -- the first attempt already
+    happened immediately -- so it is only retried on a refreshing tick."""
+    monkeypatch.setattr(
+        "notifier.__main__.send_message",
+        functools.partial(real_send_message, sleep=lambda _: None),
+    )
+    respx.get(UPDATES_URL).mock(return_value=httpx.Response(200, json={"ok": True, "result": []}))
+    send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    cfg = _cfg(tmp_path)
+    state = State(
+        sent={}, cached={},
+        pending_greetings={"-100999": encode_pending_greeting(NOT_DUE, "News")},
+    )
+    with httpx.Client() as client:
+        run_once(cfg, client, state, NOT_DUE, refresh=False)
+        assert send.call_count == 0
+        assert "-100999" in state.pending_greetings
+        run_once(cfg, client, state, NOT_DUE, refresh=True)
+    assert send.call_count == 1
+    assert "-100999" in state.greeted
+
+
+@respx.mock
+def test_a_bad_key_in_pending_greetings_does_not_block_a_good_one(tmp_path):
+    """NEW FINDING B. A non-numeric key used to reach `int()` before any send was
+    attempted, inside `_greet`'s own broad except -- so one bad row silently disabled
+    greeting for every chat, permanently, behind a generic 'failed unexpectedly' log
+    line. Probed before the fix: zero sends across two ticks, for a state file holding
+    `{"oops": "X", "-100999": "Good"}`. The fix drops the bad row at load and lets the
+    good one through."""
+    respx.get(UPDATES_URL).mock(return_value=httpx.Response(200, json={"ok": True, "result": []}))
+    send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    cfg = _cfg(tmp_path)
+    save_state(cfg.state_path, State(
+        sent={}, cached={},
+        pending_greetings={
+            "oops": encode_pending_greeting(NOT_DUE, "Bad"),
+            "-100999": encode_pending_greeting(NOT_DUE, "Good"),
+        },
+    ))
+    state = load_state(cfg.state_path, NOT_DUE)
+    assert "oops" not in state.pending_greetings  # dropped already, at load
+    assert "-100999" in state.pending_greetings
+    with httpx.Client() as client:
+        run_once(cfg, client, state, NOT_DUE, refresh=True)
+    assert send.call_count == 1
+    assert "-100999" in state.greeted

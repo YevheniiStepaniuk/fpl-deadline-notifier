@@ -20,6 +20,13 @@ from notifier.sources import Moment
 # Keeping it forever is what breaks the next season, whose gameweek ids start again at 1.
 KEEP_SENT_FOR = datetime.timedelta(days=30)
 
+# An intro this late has lost its purpose -- by then whoever added the bot will have
+# found the chat id another way, so there is nothing left to bound by keeping it. Also
+# what stops a chat that fails every send (blocked, kicked, or just persistently down)
+# from sitting in `pending_greetings` forever if nothing ever restarts the process to
+# reload and re-check its age.
+KEEP_PENDING_FOR = datetime.timedelta(days=1)
+
 
 @dataclasses.dataclass
 class State:
@@ -40,17 +47,20 @@ class State:
     # just for KEEP_SENT_FOR -- there is no future event that makes greeting it again
     # correct.
     greeted: set[str] = dataclasses.field(default_factory=set)
-    # Chats seen in an add event but not yet successfully greeted: chat id to title,
-    # with "" standing in for "no title" -- the one lossy part of this record, since a
-    # JSON string can't distinguish "absent" from "empty" and Telegram never sends an
-    # actually-empty one. An add moves a chat in here *before* any send is attempted,
-    # and only out again once the send has actually succeeded. That ordering is the
-    # fix for a real bug: `_greet` used to advance `update_offset` first and then try
-    # to send, so a failed send was silently confirmed away -- Telegram never
+    # Chats seen in an add event but not yet successfully greeted: chat id to
+    # `"{first_seen_iso}|{title}"` (see `encode_pending_greeting`/
+    # `decode_pending_greeting`), split on the first "|" only so a title containing
+    # one still survives. An add moves a chat in here *before* any send is attempted,
+    # and only out again once the send has actually succeeded -- or is given up on as
+    # permanently undeliverable, or ages out past `KEEP_PENDING_FOR`. That ordering is
+    # the fix for a real bug: `_greet` used to advance `update_offset` first and then
+    # try to send, so a failed send was silently confirmed away -- Telegram never
     # redelivers an update once a higher offset has been acknowledged, so a chat whose
     # intro failed to send was never seen again. Keeping "who still needs greeting"
     # here, independent of the offset, is what makes retry genuine rather than
-    # accidental.
+    # accidental. Unlike `sent`, which `prune_sent` bounds, this dict would otherwise
+    # grow without limit -- anyone who can add the bot creates an entry -- which is
+    # what `first_seen`/`KEEP_PENDING_FOR` are for.
     pending_greetings: dict[str, str] = dataclasses.field(default_factory=dict)
     # True once getUpdates has failed in a way no later tick will fix (a bad or
     # revoked token, or a webhook registered on this token -- see
@@ -129,13 +139,65 @@ def _load_greeted(raw: object) -> set[str]:
     return {item for item in raw if isinstance(item, str)}
 
 
-def _load_pending_greetings(raw: object) -> dict[str, str]:
+def encode_pending_greeting(first_seen: datetime.datetime, title: str) -> str:
+    """Pack a pending greeting's value: when the chat was first seen, plus its title.
+
+    `partition("|")` on the way back out splits on the *first* separator only, so a
+    title that happens to contain a "|" of its own still round-trips intact.
+    """
+    return f"{first_seen.isoformat()}|{title}"
+
+
+def decode_pending_greeting(value: str) -> tuple[datetime.datetime, str] | None:
+    """Inverse of `encode_pending_greeting`. None on anything unparseable -- a missing
+    separator, or a first-seen stamp that is not a real aware datetime -- so a
+    corrupted entry degrades the same way the rest of this module does rather than
+    raising.
+    """
+    first_seen_raw, sep, title = value.partition("|")
+    if not sep:
+        return None
+    try:
+        first_seen = datetime.datetime.fromisoformat(first_seen_raw)
+    except ValueError:
+        return None
+    if first_seen.tzinfo is None:
+        return None
+    return first_seen, title
+
+
+def _load_pending_greetings(raw: object, now: datetime.datetime) -> dict[str, str]:
+    """Keep only entries whose key is a chat id and whose value decodes to a
+    first-seen stamp within `KEEP_PENDING_FOR` of `now`.
+
+    The key check is not cosmetic: `_greet` calls `int(key)` to build the chat id
+    `format_intro` needs, and used to do that before ever attempting a send. One
+    non-numeric key surviving load would raise there, and because that call sits
+    inside `_greet`'s own broad except (see `__main__.py`), the exception would not
+    just skip that one chat -- it would abort the whole greeting step for the tick,
+    silently, behind a generic "failed unexpectedly" log line, taking every *other*
+    pending chat down with it. Dropping the bad row here, the same place `prune_sent`
+    drops a bad `sent` entry, is what keeps one corrupt row from costing every chat
+    still waiting to be greeted.
+    """
     if not isinstance(raw, dict):
         return {}
-    return {
-        key: title for key, title in raw.items()
-        if isinstance(key, str) and isinstance(title, str)
-    }
+    cutoff = now - KEEP_PENDING_FOR
+    pending: dict[str, str] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        try:
+            int(key)
+        except ValueError:
+            continue
+        decoded = decode_pending_greeting(value)
+        if decoded is None:
+            continue
+        first_seen, _title = decoded
+        if first_seen >= cutoff:
+            pending[key] = value
+    return pending
 
 
 def load_state(path: pathlib.Path, now: datetime.datetime) -> State:
@@ -170,7 +232,7 @@ def load_state(path: pathlib.Path, now: datetime.datetime) -> State:
         cached=cached,
         update_offset=_load_update_offset(raw.get("update_offset")),
         greeted=_load_greeted(raw.get("greeted")),
-        pending_greetings=_load_pending_greetings(raw.get("pending_greetings")),
+        pending_greetings=_load_pending_greetings(raw.get("pending_greetings"), now),
         # polling_disabled is deliberately not restored here -- see the field's own
         # comment on State. Every fresh load starts able to poll again.
     )

@@ -4,7 +4,15 @@ import json
 import pytest
 
 from notifier.sources import Moment
-from notifier.state import KEEP_SENT_FOR, State, load_state, save_state
+from notifier.state import (
+    KEEP_PENDING_FOR,
+    KEEP_SENT_FOR,
+    State,
+    decode_pending_greeting,
+    encode_pending_greeting,
+    load_state,
+    save_state,
+)
 
 WHEN = datetime.datetime(2026, 8, 28, 17, 30, tzinfo=datetime.UTC)
 MOMENT = Moment("deadline", 2, WHEN, frozenset({"fpl", "draft"}))
@@ -256,15 +264,42 @@ def test_greeted_is_saved_as_a_sorted_list_not_a_set(tmp_path):
     assert raw["greeted"] == ["-100123", "555", "987"]
 
 
+def test_encode_and_decode_pending_greeting_round_trips():
+    value = encode_pending_greeting(WHEN, "News")
+    assert decode_pending_greeting(value) == (WHEN, "News")
+
+
+def test_a_title_containing_a_pipe_survives_the_round_trip():
+    """`partition("|")` splits on the *first* separator only, so a title that happens
+    to contain a pipe of its own is not truncated."""
+    value = encode_pending_greeting(WHEN, "Fish | Chips FC")
+    assert decode_pending_greeting(value) == (WHEN, "Fish | Chips FC")
+
+
+def test_decode_rejects_a_value_with_no_separator():
+    assert decode_pending_greeting("not-encoded-at-all") is None
+
+
+def test_decode_rejects_an_unparseable_first_seen_stamp():
+    assert decode_pending_greeting("not-a-date|News") is None
+
+
+def test_decode_rejects_a_naive_first_seen_stamp():
+    naive = datetime.datetime(2026, 8, 24).isoformat()  # no tzinfo
+    assert decode_pending_greeting(f"{naive}|News") is None
+
+
 def test_pending_greetings_round_trips(tmp_path):
     """A chat waiting on a retry must survive a restart -- that is the whole point of
     keeping it separate from `greeted` rather than only in memory."""
     path = tmp_path / "state.json"
-    save_state(path, State(
-        sent={}, cached={}, pending_greetings={"-100999": "News", "555": ""},
-    ))
+    encoded = {
+        "-100999": encode_pending_greeting(NOW, "News"),
+        "555": encode_pending_greeting(NOW, ""),
+    }
+    save_state(path, State(sent={}, cached={}, pending_greetings=encoded))
     restored = load_state(path, NOW)
-    assert restored.pending_greetings == {"-100999": "News", "555": ""}
+    assert restored.pending_greetings == encoded
 
 
 def test_a_non_dict_pending_greetings_degrades_to_empty(tmp_path):
@@ -274,14 +309,65 @@ def test_a_non_dict_pending_greetings_degrades_to_empty(tmp_path):
 
 
 def test_non_string_values_in_pending_greetings_are_dropped(tmp_path):
-    """A hand-edited or schema-drifted title must not sail through -- `format_intro`
+    """A hand-edited or schema-drifted value must not sail through -- `format_intro`
     expects `str | None`, the same discipline `parse_added` applies to a raw title."""
     path = tmp_path / "state.json"
+    good = encode_pending_greeting(NOW, "fine")
     path.write_text(json.dumps({
         "sent": {}, "cached": {},
-        "pending_greetings": {"-1": "fine", "-2": 42, "-3": None},
+        "pending_greetings": {"-1": good, "-2": 42, "-3": None},
     }))
-    assert load_state(path, NOW).pending_greetings == {"-1": "fine"}
+    assert load_state(path, NOW).pending_greetings == {"-1": good}
+
+
+def test_a_pending_greeting_with_an_unparseable_value_is_dropped(tmp_path):
+    """No "|" at all -- `decode_pending_greeting` returns None for it, and a value
+    that can't be decoded can't be retried from either, so it is dropped exactly like
+    a `sent` entry with an unparseable stamp."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "sent": {}, "cached": {}, "pending_greetings": {"-1": "no-separator-here"},
+    }))
+    assert load_state(path, NOW).pending_greetings == {}
+
+
+def test_a_non_numeric_key_in_pending_greetings_is_dropped(tmp_path):
+    """`_greet` calls `int(key)` to build the chat id `format_intro` needs, and that
+    used to happen before any send was attempted. A non-numeric key surviving load
+    would raise there and, because that call sits inside `_greet`'s own broad except,
+    take every *other* pending chat down with it for the tick -- silently, behind a
+    generic "failed unexpectedly" line. This is finding B: the fix is here, at load,
+    not at the point of failure."""
+    path = tmp_path / "state.json"
+    good = encode_pending_greeting(NOW, "Good")
+    path.write_text(json.dumps({
+        "sent": {}, "cached": {},
+        "pending_greetings": {"oops": encode_pending_greeting(NOW, "Bad"), "-100999": good},
+    }))
+    assert load_state(path, NOW).pending_greetings == {"-100999": good}
+
+
+def test_a_pending_greeting_older_than_keep_pending_for_is_dropped(tmp_path):
+    """An intro this late has lost its purpose, and is also what stops a chat that
+    fails every send from sitting here forever in a process that never restarts to
+    re-check its age."""
+    path = tmp_path / "state.json"
+    stale = NOW - KEEP_PENDING_FOR - datetime.timedelta(seconds=1)
+    path.write_text(json.dumps({
+        "sent": {}, "cached": {},
+        "pending_greetings": {"-1": encode_pending_greeting(stale, "Old")},
+    }))
+    assert load_state(path, NOW).pending_greetings == {}
+
+
+def test_a_fresh_pending_greeting_survives_load(tmp_path):
+    path = tmp_path / "state.json"
+    recent = NOW - datetime.timedelta(hours=1)
+    value = encode_pending_greeting(recent, "Fresh")
+    path.write_text(json.dumps({
+        "sent": {}, "cached": {}, "pending_greetings": {"-1": value},
+    }))
+    assert load_state(path, NOW).pending_greetings == {"-1": value}
 
 
 def test_polling_disabled_does_not_survive_a_save_and_load_round_trip(tmp_path):

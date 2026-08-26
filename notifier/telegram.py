@@ -23,7 +23,18 @@ _PERMANENT = {400, 401, 403, 404}
 
 
 class TelegramError(Exception):
-    """Raised when a message could not be delivered. State must not be written."""
+    """Raised when a message could not be delivered. State must not be written.
+
+    `permanent` distinguishes a status Telegram will not reconsider on a later
+    attempt (bot blocked or kicked, chat not found, bad token -- see `_PERMANENT`)
+    from simply running out of attempts against a transient failure. The caller uses
+    it to decide whether retrying is worth anything at all, rather than retrying a
+    chat that will never accept a message again.
+    """
+
+    def __init__(self, message: str, *, permanent: bool) -> None:
+        super().__init__(message)
+        self.permanent = permanent
 
 
 def api_url(token: str, method: str = "sendMessage") -> str:
@@ -72,7 +83,8 @@ def send_message(
             if response.status_code in _PERMANENT:
                 raise TelegramError(
                     f"Telegram rejected the message with {response.status_code}: "
-                    f"{_describe(response)}"
+                    f"{_describe(response)}",
+                    permanent=True,
                 )
             if response.status_code == 200:
                 try:
@@ -98,4 +110,6 @@ def send_message(
             sleep(_BACKOFF[attempt])
     # The token is deliberately absent from this message: it is logged, and logs get
     # pasted into issues.
-    raise TelegramError(f"Telegram send failed after {ATTEMPTS} attempts. Last: {last}")
+    raise TelegramError(
+        f"Telegram send failed after {ATTEMPTS} attempts. Last: {last}", permanent=False
+    )

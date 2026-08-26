@@ -28,7 +28,15 @@ from notifier import config, sources
 from notifier.render import format_intro, format_message
 from notifier.schedule import Alert, due_alerts
 from notifier.sources import Moment
-from notifier.state import KEEP_SENT_FOR, State, load_state, prune_sent, save_state
+from notifier.state import (
+    KEEP_SENT_FOR,
+    State,
+    decode_pending_greeting,
+    encode_pending_greeting,
+    load_state,
+    prune_sent,
+    save_state,
+)
 from notifier.telegram import TelegramError, send_message
 from notifier.updates import PermanentPollError, fetch_added
 
@@ -115,6 +123,7 @@ def _greet(
     state: State,
     moments: Iterable[Moment],
     now: datetime.datetime,
+    refresh: bool,
 ) -> bool:
     """Poll once for chats that just added the bot, and send each a one-time intro.
 
@@ -127,7 +136,7 @@ def _greet(
     next time something else changes.
     """
     try:
-        return _poll_and_greet(cfg, client, state, moments, now)
+        return _poll_and_greet(cfg, client, state, moments, now, refresh)
     except Exception as exc:
         log.error("the greeting step failed unexpectedly and was skipped: %s", exc)
         return False
@@ -139,23 +148,34 @@ def _poll_and_greet(
     state: State,
     moments: Iterable[Moment],
     now: datetime.datetime,
+    refresh: bool,
 ) -> bool:
     """The actual poll-and-greet work, unwrapped from `_greet`'s safety net.
 
-    Runs on every tick rather than only on a refreshing one: `_refresh`'s hourly
-    cadence exists to be polite to two APIs this service does not control, but
+    Polling runs on every tick rather than only on a refreshing one: `_refresh`'s
+    hourly cadence exists to be polite to two APIs this service does not control, but
     getUpdates is Telegram's own endpoint and the whole reason it was chosen over a
-    webhook was to stay responsive without a second thread. Gating it on the hourly
-    refresh would mean an intro arriving up to an hour after someone adds the bot.
+    webhook was to stay responsive without a second thread. Gating discovery on the
+    hourly refresh would mean an intro arriving up to an hour after someone adds the
+    bot.
 
     Polling and sending are deliberately independent state: the offset only ever
     means "Telegram has confirmed I've seen up to here", and advancing it is safe
     regardless of whether a send later fails. Who still needs greeting lives in
     `state.pending_greetings` instead, added to on the way in and removed only once a
-    send actually succeeds -- so a failed send is retried on the next tick no matter
-    what the offset has moved on to.
+    send actually succeeds -- so a failed send is retried later no matter what the
+    offset has moved on to.
+
+    Retrying, unlike discovering, is *not* latency-sensitive: the first attempt at a
+    newly-added chat already happens this same tick, on every tick, regardless of
+    `refresh`. A chat already in `pending_greetings` from an earlier tick is only
+    retried when `refresh` is true. Retried on every tick, a chat that is transiently
+    failing (rate limits, a Telegram-side blip) would cost three attempts with 1s/4s
+    backoff every 60 seconds, forever, for something nobody is waiting on with the
+    same urgency as a brand-new add.
     """
     changed = False
+    just_added: set[str] = set()
 
     if state.polling_disabled:
         # Already given up this process's lifetime -- see `PermanentPollError` and
@@ -191,19 +211,53 @@ def _poll_and_greet(
                 # chat id if you want alerts sent to a DM rather than a channel. The
                 # `greeted`/`pending_greetings` dedupe above is what keeps this
                 # bounded to one message per chat rather than one per /start.
-                state.pending_greetings[key] = chat.title or ""
+                state.pending_greetings[key] = encode_pending_greeting(now, chat.title or "")
+                just_added.add(key)
                 changed = True
 
     next_deadline = _next_deadline(moments, now)
-    for key, title in list(state.pending_greetings.items()):
-        text = format_intro(int(key), title or None, next_deadline, cfg.tz)
+    for key, value in list(state.pending_greetings.items()):
+        if key not in just_added and not refresh:
+            # A retry, not a fresh discovery -- the latency budget that justifies
+            # polling every tick does not apply here. See the docstring above.
+            continue
+
+        try:
+            chat_id = int(key)
+        except ValueError:
+            chat_id = None
+        decoded = decode_pending_greeting(value)
+        if chat_id is None or decoded is None:
+            # `load_state` already keeps a malformed row from ever reaching here, but
+            # a `State` built directly (as tests do, and as a future caller might)
+            # skips that check. Dropping the one bad entry here, rather than letting
+            # `int()` or `format_intro`'s annotation raise, is what stops it from
+            # taking every *other* pending chat down through `_greet`'s broad except.
+            log.error("dropping an unreadable pending greeting for chat %r", key)
+            del state.pending_greetings[key]
+            changed = True
+            continue
+
+        _first_seen, title = decoded
+        text = format_intro(chat_id, title or None, next_deadline, cfg.tz)
         try:
             send_message(client, cfg.bot_token, key, text)
         except TelegramError as exc:
-            # Left in `pending_greetings`, so the next tick retries -- the same
-            # asymmetry `run_once` already uses for alerts: a chat that never sees
-            # the intro is worse than one that sees it twice.
-            log.error("intro to chat %s failed, will retry next tick: %s", key, exc)
+            if exc.permanent:
+                # Telegram has said, unambiguously, that this will not go through --
+                # blocked, kicked, or a chat that no longer exists. Retrying is not
+                # patience, it is the exact pathology `PermanentPollError` was just
+                # introduced to remove from the poll side, reappearing on the send
+                # side: one request and one log line every tick, forever, for a chat
+                # that will never accept the message.
+                log.error("giving up on chat %s: %s", key, exc)
+                del state.pending_greetings[key]
+                changed = True
+            else:
+                # Left in `pending_greetings`, so a later tick retries -- the same
+                # asymmetry `run_once` already uses for alerts: a chat that never
+                # sees the intro is worse than one that sees it twice.
+                log.error("intro to chat %s failed, will retry later: %s", key, exc)
             continue
         log.info("greeted chat %s", key)
         state.greeted.add(key)
@@ -259,7 +313,7 @@ def run_once(
             # not re-fire the half whose key was never written.
             _record(state, to_send)
 
-    greeted = _greet(cfg, client, state, moments, now)
+    greeted = _greet(cfg, client, state, moments, now, refresh)
 
     if to_send or to_retire or refresh or greeted:
         try:
