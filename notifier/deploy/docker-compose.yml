@@ -24,6 +24,13 @@ services:
       NOTIFIER_TZ: ${NOTIFIER_TZ:-Europe/London}
       NOTIFIER_POLL_SECONDS: ${NOTIFIER_POLL_SECONDS:-60}
       NOTIFIER_REFRESH_SECONDS: ${NOTIFIER_REFRESH_SECONDS:-3600}
+      # Empty defaults, because both are optional -- but they have to be listed. This
+      # block names every variable individually rather than mounting .env wholesale, so
+      # a variable absent from here is simply invisible inside the container: the
+      # service would start clean, log nothing, and quietly emit only the six lines
+      # that need no roster. Add new NOTIFIER_* settings here as well as to .env.
+      NOTIFIER_ROSTER: ${NOTIFIER_ROSTER:-}
+      NOTIFIER_BANTER: ${NOTIFIER_BANTER:-on}
 
     # A named volume, not a bind mount. The container runs as uid 10001, and a bind
     # mount would arrive owned by the host user, so the first save would fail with
