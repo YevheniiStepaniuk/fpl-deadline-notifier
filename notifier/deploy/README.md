@@ -42,8 +42,14 @@ The image carries `httpx` and nothing else — that is the notifier's only third
 import, so the dashboard's streamlit/pandas/anthropic stack stays out of it. 220MB,
 running as uid 10001 with a read-only root filesystem and all capabilities dropped.
 
-    docker compose -f notifier/deploy/docker-compose.yml up -d --build
-    docker compose -f notifier/deploy/docker-compose.yml logs -f
+    docker compose --env-file .env -f notifier/deploy/docker-compose.yml up -d --build
+    docker compose --env-file .env -f notifier/deploy/docker-compose.yml logs -f
+
+`--env-file .env` is required, not decoration. Compose resolves `.env` relative to the
+compose file's own directory, so without it Compose looks for `notifier/deploy/.env` and
+finds nothing. The `${...:?}` guards then abort the run naming the missing variable,
+which is the failure you want rather than a notifier that starts and never sends — but
+it looks like a missing token when it is really a missing flag.
 
 Check it first, which needs no compose file:
 

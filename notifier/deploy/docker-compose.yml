@@ -1,7 +1,10 @@
-# Run from the repository root:
-#   docker compose -f notifier/deploy/docker-compose.yml up -d --build
+# Run from the repository root, and pass --env-file:
+#   docker compose --env-file .env -f notifier/deploy/docker-compose.yml up -d --build
 #
-# Compose reads `.env` from the directory it runs in for the ${...} values below.
+# --env-file is not optional. Compose resolves `.env` relative to the *compose file's*
+# directory, not the one you run the command in, so without it Compose looks for
+# notifier/deploy/.env, finds nothing, and the ${...:?} guards below abort the run.
+# Verified: the bare command fails with "required variable TELEGRAM_CHAT_ID is missing".
 services:
   notifier:
     build:
