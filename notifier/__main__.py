@@ -30,7 +30,7 @@ from notifier.schedule import Alert, due_alerts
 from notifier.sources import Moment
 from notifier.state import KEEP_SENT_FOR, State, load_state, prune_sent, save_state
 from notifier.telegram import TelegramError, send_message
-from notifier.updates import fetch_added
+from notifier.updates import PermanentPollError, fetch_added
 
 log = logging.getLogger("notifier")
 
@@ -118,52 +118,96 @@ def _greet(
 ) -> bool:
     """Poll once for chats that just added the bot, and send each a one-time intro.
 
+    The whole body sits behind one broad except, not just the fetch: nothing
+    realistic raises out of `format_intro` or a chat's send today, but this is called
+    from a `while True` in `main` with no try of its own, and this is still a
+    convenience bolted beside the thing that matters. An exception already applied to
+    `state` before it escaped stays applied -- an advanced offset, a chat moved into
+    `pending_greetings` -- only the save on *this* tick is skipped, and it catches up
+    next time something else changes.
+    """
+    try:
+        return _poll_and_greet(cfg, client, state, moments, now)
+    except Exception as exc:
+        log.error("the greeting step failed unexpectedly and was skipped: %s", exc)
+        return False
+
+
+def _poll_and_greet(
+    cfg: config.Config,
+    client: httpx.Client,
+    state: State,
+    moments: Iterable[Moment],
+    now: datetime.datetime,
+) -> bool:
+    """The actual poll-and-greet work, unwrapped from `_greet`'s safety net.
+
     Runs on every tick rather than only on a refreshing one: `_refresh`'s hourly
     cadence exists to be polite to two APIs this service does not control, but
     getUpdates is Telegram's own endpoint and the whole reason it was chosen over a
     webhook was to stay responsive without a second thread. Gating it on the hourly
     refresh would mean an intro arriving up to an hour after someone adds the bot.
 
-    Only fetch_added's network call is isolated here, the same shape as `_refresh`'s
-    per-source try/except: this is a convenience bolted beside the thing that
-    matters, and a webhook conflict, a network blip or a malformed update must never
-    stop a deadline alert on the same tick. A per-chat send failure is handled
-    separately below, for the same reason `run_once` does not let one failed alert
-    stop another.
+    Polling and sending are deliberately independent state: the offset only ever
+    means "Telegram has confirmed I've seen up to here", and advancing it is safe
+    regardless of whether a send later fails. Who still needs greeting lives in
+    `state.pending_greetings` instead, added to on the way in and removed only once a
+    send actually succeeds -- so a failed send is retried on the next tick no matter
+    what the offset has moved on to.
     """
-    try:
-        added, highest = fetch_added(client, cfg.bot_token, state.update_offset)
-    except Exception as exc:
-        log.warning("polling for chat updates failed (%s); will retry next tick", exc)
-        return False
-
     changed = False
-    if highest is not None:
-        # +1, not `highest` itself: Telegram treats the offset as "give me updates
-        # after this id", so sending `highest` back would redeliver it forever. Get
-        # this wrong the other way (highest + 2) and an update silently never arrives.
-        state.update_offset = highest + 1
-        changed = True
 
-    if not added:
-        return changed
+    if state.polling_disabled:
+        # Already given up this process's lifetime -- see `PermanentPollError` and
+        # `State.polling_disabled`. Chats already pending still deserve their retry
+        # below; only the network poll itself is skipped.
+        pass
+    else:
+        try:
+            added, highest = fetch_added(client, cfg.bot_token, state.update_offset)
+        except PermanentPollError as exc:
+            # Logged once, here, and never again this process: the cause needs a
+            # restart to clear, so repeating the warning every tick would just be
+            # noise for a service meant to run a whole season.
+            log.error("polling for chat updates disabled: %s", exc)
+            state.polling_disabled = True
+        except Exception as exc:
+            log.warning("polling for chat updates failed (%s); will retry next tick", exc)
+        else:
+            if highest is not None:
+                # +1, not `highest` itself: Telegram treats the offset as "give me
+                # updates after this id", so sending `highest` back would redeliver it
+                # forever. Get this wrong the other way (highest + 2) and an update
+                # silently never arrives.
+                state.update_offset = highest + 1
+                changed = True
+            for chat in added:
+                key = str(chat.chat_id)
+                if key in state.greeted or key in state.pending_greetings:
+                    continue
+                # Private chats are included on purpose, not an oversight: Telegram
+                # sends my_chat_member the moment a user first /start's the bot, and
+                # that genuinely is the setup flow -- it is how you learn your own
+                # chat id if you want alerts sent to a DM rather than a channel. The
+                # `greeted`/`pending_greetings` dedupe above is what keeps this
+                # bounded to one message per chat rather than one per /start.
+                state.pending_greetings[key] = chat.title or ""
+                changed = True
 
     next_deadline = _next_deadline(moments, now)
-    for chat in added:
-        key = str(chat.chat_id)
-        if key in state.greeted:
-            continue
-        text = format_intro(chat.chat_id, chat.title, next_deadline, cfg.tz)
+    for key, title in list(state.pending_greetings.items()):
+        text = format_intro(int(key), title or None, next_deadline, cfg.tz)
         try:
             send_message(client, cfg.bot_token, key, text)
         except TelegramError as exc:
-            # Not recorded, so the next tick retries -- the same asymmetry `run_once`
-            # already uses for alerts: a chat that never sees the intro is worse than
-            # one that sees it twice.
+            # Left in `pending_greetings`, so the next tick retries -- the same
+            # asymmetry `run_once` already uses for alerts: a chat that never sees
+            # the intro is worse than one that sees it twice.
             log.error("intro to chat %s failed, will retry next tick: %s", key, exc)
             continue
-        log.info("greeted new chat %s (%s)", key, chat.chat_type)
+        log.info("greeted chat %s", key)
         state.greeted.add(key)
+        del state.pending_greetings[key]
         changed = True
     return changed
 

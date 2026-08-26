@@ -23,9 +23,18 @@ ALLOWED_UPDATES = ["my_chat_member"]
 
 # A `my_chat_member` update fires on every status transition, not just an add: a
 # promotion from member to administrator is one of these too, and so is a demotion.
-# An "add" is specifically a move from one of these sets to the other.
+# An "add" is specifically a move from one of these sets to the other. "restricted" is
+# deliberately absent from both -- see `_is_present`/`_is_absent` below, since that one
+# status can mean either depending on a separate field.
 PRESENT = {"member", "administrator", "creator"}
 ABSENT = {"left", "kicked"}
+
+# getUpdates statuses that will not clear on their own: a bad or revoked token, or a
+# webhook registered on this token (handled separately, since Telegram reports that one
+# as a bare 409 rather than a member of this set). Named the same way telegram.py names
+# `_PERMANENT`, for the same reason -- retrying these on the next tick wastes a request
+# and a log line for an outcome that has already been decided.
+_PERMANENT_STATUSES = {401, 404}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -35,13 +44,55 @@ class ChatAdded:
     chat_type: str  # "channel" | "group" | "supergroup" | "private"
 
 
-class WebhookConflictError(Exception):
+class PermanentPollError(Exception):
+    """getUpdates failed in a way no later tick will fix on its own.
+
+    The caller (`_greet`) stops polling for the rest of the process's life on one of
+    these rather than logging the same warning every tick forever. Fixing the cause --
+    a bad token, a lingering webhook -- needs a restart anyway, and a restart is also
+    what clears this and lets polling resume.
+    """
+
+
+class WebhookConflictError(PermanentPollError):
     """getUpdates returned 409: a webhook is registered on this token.
 
     Polling and a webhook are mutually exclusive on the same bot token, and Telegram
     reports the clash as a bare 409 -- naming it here means the cause is in the log
     instead of something someone has to go and search for.
     """
+
+
+def _describe(response: httpx.Response) -> str:
+    # Mirrors telegram.py's own `_describe`, kept as a small duplicate rather than a
+    # cross-module import of a private helper: this module's failure messages are its
+    # own business, not telegram.py's to define.
+    try:
+        body = response.json()
+        if isinstance(body, dict):
+            return str(body.get("description", response.text))[:200]
+        return response.text[:200]
+    except ValueError:
+        return response.text[:200]
+
+
+def _is_present(member: dict) -> bool:
+    status = member.get("status")
+    if status == "restricted":
+        # Telegram overloads "restricted" for both "still in the chat, with limits"
+        # and "removed via a restriction" -- `is_member` is the field that actually
+        # says which. Treating the bare status string as present (like the other
+        # PRESENT entries) would miss a real add whenever the chat's default
+        # permissions land a freshly-added bot in "restricted" instead of "member".
+        return bool(member.get("is_member"))
+    return status in PRESENT
+
+
+def _is_absent(member: dict) -> bool:
+    status = member.get("status")
+    if status == "restricted":
+        return not member.get("is_member")
+    return status in ABSENT
 
 
 def parse_added(payload: dict) -> tuple[list[ChatAdded], int | None]:
@@ -80,13 +131,20 @@ def parse_added(payload: dict) -> tuple[list[ChatAdded], int | None]:
         old = member.get("old_chat_member")
         if not isinstance(chat, dict) or not isinstance(new, dict) or not isinstance(old, dict):
             continue
-        if new.get("status") not in PRESENT or old.get("status") not in ABSENT:
+        if not _is_present(new) or not _is_absent(old):
             continue
         chat_id = chat.get("id")
         chat_type = chat.get("type")
         if not isinstance(chat_id, int) or not isinstance(chat_type, str):
             continue
-        added.append(ChatAdded(chat_id=chat_id, title=chat.get("title"), chat_type=chat_type))
+        title = chat.get("title")
+        if not isinstance(title, str):
+            # Gated like every other field pulled off an untrusted payload: a
+            # malformed `"title"` must not sail through and land in a message text
+            # as `str({'a': 1})`, since format_intro's `str | None` annotation is a
+            # promise this is where it gets kept.
+            title = None
+        added.append(ChatAdded(chat_id=chat_id, title=title, chat_type=chat_type))
     return added, highest
 
 
@@ -100,8 +158,10 @@ def fetch_added(
 
     `timeout=0` asks Telegram for a short poll rather than its default long poll, so
     this call returns immediately and fits inside the existing tick loop with no
-    second thread. Raises on any httpx failure; the caller isolates it, exactly as
-    `sources.fetch_source` leaves raising to itself and isolation to `_refresh`.
+    second thread. Raises `PermanentPollError` (or its `WebhookConflictError`
+    subclass) for a failure the caller should stop retrying; anything else -- a
+    network blip, a 5xx -- propagates as a plain httpx error for the caller to isolate
+    and retry next tick, exactly as `sources.fetch_source` leaves raising to itself.
     """
     params: dict[str, object] = {
         "allowed_updates": json.dumps(ALLOWED_UPDATES),
@@ -119,6 +179,12 @@ def fetch_added(
         raise WebhookConflictError(
             "getUpdates returned 409: a webhook is set on this bot token. Remove the "
             "webhook before polling can receive updates."
+        )
+    if response.status_code in _PERMANENT_STATUSES:
+        raise PermanentPollError(
+            f"getUpdates returned {response.status_code}: {_describe(response)}. This "
+            "will not fix itself without operator action; polling is disabled until "
+            "the process restarts."
         )
     response.raise_for_status()
     return parse_added(response.json())

@@ -5,6 +5,7 @@ import respx
 from notifier.telegram import api_url
 from notifier.updates import (
     ChatAdded,
+    PermanentPollError,
     WebhookConflictError,
     fetch_added,
     parse_added,
@@ -152,6 +153,64 @@ def test_a_chat_with_no_title_reports_none():
     assert added[0].title is None
 
 
+def test_a_non_string_title_is_dropped_rather_than_rendered_raw():
+    """A malformed `"title"` must not sail through to `format_intro`, whose `str |
+    None` annotation is a promise this is where it gets kept -- otherwise a message
+    could end up saying 'added to "{'a': 1}"'."""
+    payload = {"ok": True, "result": [
+        _my_chat_member(1, -1, "channel", "left", "member"),
+    ]}
+    payload["result"][0]["my_chat_member"]["chat"]["title"] = {"a": 1}
+    added, _ = parse_added(payload)
+    assert added[0].title is None
+
+
+def test_restricted_with_is_member_true_is_an_add():
+    """A supergroup with restrictive defaults can land a freshly-added bot in
+    'restricted' rather than 'member'. The bare status string does not say whether the
+    bot is actually in the chat -- `is_member` does -- so a status-only present/absent
+    check would miss this add entirely."""
+    payload = {"ok": True, "result": [{
+        "update_id": 1,
+        "my_chat_member": {
+            "chat": {"id": -1, "type": "supergroup"},
+            "old_chat_member": {"status": "left"},
+            "new_chat_member": {"status": "restricted", "is_member": True},
+        },
+    }]}
+    added, _ = parse_added(payload)
+    assert [c.chat_id for c in added] == [-1]
+
+
+def test_restricted_with_is_member_false_is_absent_so_a_re_add_still_counts():
+    payload = {"ok": True, "result": [{
+        "update_id": 1,
+        "my_chat_member": {
+            "chat": {"id": -1, "type": "supergroup"},
+            "old_chat_member": {"status": "restricted", "is_member": False},
+            "new_chat_member": {"status": "member"},
+        },
+    }]}
+    added, _ = parse_added(payload)
+    assert [c.chat_id for c in added] == [-1]
+
+
+def test_restricted_to_member_is_not_a_second_add_once_already_present():
+    """The chat was already counted present at left -> restricted(is_member=True); the
+    following restricted -> member transition must not double-fire, or that chat would
+    get a second intro for the same join."""
+    payload = {"ok": True, "result": [{
+        "update_id": 1,
+        "my_chat_member": {
+            "chat": {"id": -1, "type": "supergroup"},
+            "old_chat_member": {"status": "restricted", "is_member": True},
+            "new_chat_member": {"status": "member"},
+        },
+    }]}
+    added, _ = parse_added(payload)
+    assert added == []
+
+
 @respx.mock
 def test_fetch_added_requests_only_my_chat_member_updates():
     """allowed_updates limits the backlog Telegram queues to the one type this service
@@ -203,8 +262,41 @@ def test_a_409_names_webhooks_rather_than_leaving_a_bare_status_code():
     assert "webhook" in str(excinfo.value).lower()
 
 
+def test_webhook_conflict_is_a_permanent_poll_error():
+    """`_greet` catches `PermanentPollError` to decide whether to stop polling for the
+    rest of the process; 409 has to be one of those or it would be warned about every
+    tick forever instead of disabling polling once."""
+    assert issubclass(WebhookConflictError, PermanentPollError)
+
+
+@respx.mock
+def test_a_401_disables_further_polling():
+    """A bad or revoked token will be just as bad on the next tick. Raising the
+    dedicated error is what lets `_greet` stop trying instead of logging the same
+    warning every 60 seconds for a service meant to run all season."""
+    respx.get(UPDATES_URL).mock(
+        return_value=httpx.Response(401, json={"ok": False, "description": "Unauthorized"})
+    )
+    with httpx.Client() as client, pytest.raises(PermanentPollError) as excinfo:
+        fetch_added(client, TOKEN, None)
+    assert "401" in str(excinfo.value)
+
+
+@respx.mock
+def test_a_404_disables_further_polling():
+    """404 from getUpdates means the token itself does not resolve to a bot -- no
+    retry fixes that either."""
+    respx.get(UPDATES_URL).mock(
+        return_value=httpx.Response(404, json={"ok": False, "description": "Not Found"})
+    )
+    with httpx.Client() as client, pytest.raises(PermanentPollError):
+        fetch_added(client, TOKEN, None)
+
+
 @respx.mock
 def test_an_http_error_propagates_for_the_caller_to_isolate():
+    """A 500 is Telegram's problem, not the token's -- transient, so it must not be
+    treated as a PermanentPollError and must not disable polling."""
     respx.get(UPDATES_URL).mock(return_value=httpx.Response(500))
     with httpx.Client() as client, pytest.raises(httpx.HTTPStatusError):
         fetch_added(client, TOKEN, None)

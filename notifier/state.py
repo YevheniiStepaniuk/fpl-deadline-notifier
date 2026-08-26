@@ -40,6 +40,26 @@ class State:
     # just for KEEP_SENT_FOR -- there is no future event that makes greeting it again
     # correct.
     greeted: set[str] = dataclasses.field(default_factory=set)
+    # Chats seen in an add event but not yet successfully greeted: chat id to title,
+    # with "" standing in for "no title" -- the one lossy part of this record, since a
+    # JSON string can't distinguish "absent" from "empty" and Telegram never sends an
+    # actually-empty one. An add moves a chat in here *before* any send is attempted,
+    # and only out again once the send has actually succeeded. That ordering is the
+    # fix for a real bug: `_greet` used to advance `update_offset` first and then try
+    # to send, so a failed send was silently confirmed away -- Telegram never
+    # redelivers an update once a higher offset has been acknowledged, so a chat whose
+    # intro failed to send was never seen again. Keeping "who still needs greeting"
+    # here, independent of the offset, is what makes retry genuine rather than
+    # accidental.
+    pending_greetings: dict[str, str] = dataclasses.field(default_factory=dict)
+    # True once getUpdates has failed in a way no later tick will fix (a bad or
+    # revoked token, or a webhook registered on this token -- see
+    # `updates.PermanentPollError`). Deliberately absent from `save_state`'s payload
+    # and never restored by `load_state`: the only real fix for either cause is to
+    # change the token or remove the webhook and restart, and restarting is exactly
+    # what resets this back to False. Persisting it would mean a *fixed* token still
+    # couldn't poll again until someone noticed and hand-edited the state file.
+    polling_disabled: bool = False
 
 
 def _moment_to_json(moment: Moment) -> dict:
@@ -109,6 +129,15 @@ def _load_greeted(raw: object) -> set[str]:
     return {item for item in raw if isinstance(item, str)}
 
 
+def _load_pending_greetings(raw: object) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        key: title for key, title in raw.items()
+        if isinstance(key, str) and isinstance(title, str)
+    }
+
+
 def load_state(path: pathlib.Path, now: datetime.datetime) -> State:
     try:
         raw = json.loads(path.read_text())
@@ -141,6 +170,9 @@ def load_state(path: pathlib.Path, now: datetime.datetime) -> State:
         cached=cached,
         update_offset=_load_update_offset(raw.get("update_offset")),
         greeted=_load_greeted(raw.get("greeted")),
+        pending_greetings=_load_pending_greetings(raw.get("pending_greetings")),
+        # polling_disabled is deliberately not restored here -- see the field's own
+        # comment on State. Every fresh load starts able to poll again.
     )
 
 
@@ -154,6 +186,9 @@ def save_state(path: pathlib.Path, state: State) -> None:
         },
         "update_offset": state.update_offset,
         "greeted": sorted(state.greeted),
+        "pending_greetings": state.pending_greetings,
+        # polling_disabled is intentionally not written -- see the field's own
+        # comment on State.
     }
     # Write and rename, so a crash mid-write leaves the previous file intact rather
     # than a truncated one. The temp sits in the same directory to keep the rename on

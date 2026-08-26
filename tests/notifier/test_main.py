@@ -388,23 +388,45 @@ def test_a_chat_already_greeted_gets_no_second_intro(tmp_path):
 
 
 @respx.mock
-def test_a_failed_greeting_is_not_recorded_so_the_next_tick_retries(tmp_path, monkeypatch):
-    """The same asymmetry `run_once` already uses for alerts: an unsent intro must be
-    retried, never silently written off as delivered."""
+def test_a_failed_greeting_is_not_lost_when_the_offset_has_already_moved_on(tmp_path, monkeypatch):
+    """Regression test for a real bug: `_greet` used to advance `state.update_offset`
+    to `highest + 1` *before* attempting the send. Telegram treats a later offset as
+    confirmation and drops the batch -- it never redelivers an update once a higher
+    offset has been acknowledged -- so a chat whose send failed was silently gone for
+    good, even though nothing was ever recorded in `greeted` to explain why.
+
+    The getUpdates fake here honours the `offset` query parameter the way Telegram
+    really does: once tick 1 has (correctly) advanced the offset past update_id 1,
+    tick 2's poll returns nothing new. This only passes if retrying a pending
+    greeting is independent of the offset -- i.e. if `state.pending_greetings` (not
+    another poll) is what tick 2 retries from.
+    """
     monkeypatch.setattr(
         "notifier.__main__.send_message",
         functools.partial(real_send_message, sleep=lambda _: None),
     )
-    _mock_apis()
-    respx.get(UPDATES_URL).mock(return_value=httpx.Response(200, json={
-        "ok": True, "result": [_added_update(1, -100999)],
-    }))
-    respx.post(SEND_URL).mock(return_value=httpx.Response(500))
+    added_update = _added_update(1, -100999)
+
+    def handler(request):
+        if request.url.params.get("offset") is None:
+            return httpx.Response(200, json={"ok": True, "result": [added_update]})
+        return httpx.Response(200, json={"ok": True, "result": []})
+
+    respx.get(UPDATES_URL).mock(side_effect=handler)
+    send = respx.post(SEND_URL).mock(side_effect=[
+        httpx.Response(500), httpx.Response(500), httpx.Response(500),  # tick 1: fails
+        httpx.Response(200, json=OK),                                   # tick 2: retried
+    ])
     cfg = _cfg(tmp_path)
     state = State(sent={}, cached={})
     with httpx.Client() as client:
-        run_once(cfg, client, state, NOT_DUE, refresh=True)
-    assert "-100999" not in state.greeted
+        run_once(cfg, client, state, NOT_DUE, refresh=False)
+        assert "-100999" not in state.greeted
+        assert "-100999" in state.pending_greetings  # the retry record survives tick 1
+        run_once(cfg, client, state, NOT_DUE, refresh=False)
+    assert "-100999" in state.greeted
+    assert "-100999" not in state.pending_greetings
+    assert send.call_count == 4
 
 
 @respx.mock
@@ -485,3 +507,47 @@ def test_greet_advances_the_offset_even_with_nothing_to_greet(tmp_path):
     assert changed is True
     assert state.update_offset == 6
     assert state.greeted == set()
+
+
+@respx.mock
+def test_a_permanent_poll_failure_stops_polling_for_the_rest_of_the_process(tmp_path):
+    """A bad or revoked token, or a lingering webhook, will not clear on its own. Once
+    `_greet` has seen one of these it must not call getUpdates again -- otherwise a
+    service meant to run all season logs the same warning every 60 seconds forever."""
+    updates = respx.get(UPDATES_URL).mock(
+        return_value=httpx.Response(401, json={"ok": False, "description": "Unauthorized"})
+    )
+    cfg = _cfg(tmp_path)
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        run_once(cfg, client, state, NOT_DUE, refresh=False)
+        assert state.polling_disabled is True
+        run_once(cfg, client, state, NOT_DUE, refresh=False)
+    assert updates.call_count == 1  # the second tick never even tried
+
+
+@respx.mock
+def test_an_unexpected_exception_anywhere_in_greet_does_not_escape_run_once(tmp_path, monkeypatch):
+    """Finding: only fetch_added's call used to be isolated. Nothing realistic raises
+    out of format_intro or a chat's send today, but `_greet` is called from `main`'s
+    `while True`, which has no try of its own -- anything that did escape here would
+    end the process and every future deadline alert with it. This breaks a step nobody
+    thought needed a try (formatting the intro text) to prove the net around the whole
+    body actually catches it, not just around the network call.
+
+    The assertion is simply that `run_once` completes: if the exception escaped,
+    pytest would fail this test with `boom`'s traceback instead of reaching the end.
+    """
+    respx.get(UPDATES_URL).mock(return_value=httpx.Response(200, json={
+        "ok": True, "result": [_added_update(1, -100999)],
+    }))
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("unexpected formatting bug")
+
+    monkeypatch.setattr("notifier.__main__.format_intro", boom)
+    cfg = _cfg(tmp_path)
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        run_once(cfg, client, state, NOT_DUE, refresh=False)  # must not raise
+    assert "-100999" not in state.greeted  # the crashed attempt was not recorded either

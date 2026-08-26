@@ -198,11 +198,13 @@ def test_the_file_is_human_readable(tmp_path):
 
 
 def test_a_fresh_state_defaults_the_new_fields_so_old_construction_still_works():
-    """Every existing call site builds State with just sent= and cached=; both new
-    fields need defaults or every one of those breaks."""
+    """Every existing call site builds State with just sent= and cached=; every new
+    field needs a default or every one of those breaks."""
     state = State(sent={}, cached={})
     assert state.update_offset is None
     assert state.greeted == set()
+    assert state.pending_greetings == {}
+    assert state.polling_disabled is False
 
 
 def test_update_offset_and_greeted_round_trip(tmp_path):
@@ -252,3 +254,42 @@ def test_greeted_is_saved_as_a_sorted_list_not_a_set(tmp_path):
     save_state(path, State(sent={}, cached={}, greeted={"987", "-100123", "555"}))
     raw = json.loads(path.read_text())
     assert raw["greeted"] == ["-100123", "555", "987"]
+
+
+def test_pending_greetings_round_trips(tmp_path):
+    """A chat waiting on a retry must survive a restart -- that is the whole point of
+    keeping it separate from `greeted` rather than only in memory."""
+    path = tmp_path / "state.json"
+    save_state(path, State(
+        sent={}, cached={}, pending_greetings={"-100999": "News", "555": ""},
+    ))
+    restored = load_state(path, NOW)
+    assert restored.pending_greetings == {"-100999": "News", "555": ""}
+
+
+def test_a_non_dict_pending_greetings_degrades_to_empty(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"sent": {}, "cached": {}, "pending_greetings": ["not", "a", "dict"]}))
+    assert load_state(path, NOW).pending_greetings == {}
+
+
+def test_non_string_values_in_pending_greetings_are_dropped(tmp_path):
+    """A hand-edited or schema-drifted title must not sail through -- `format_intro`
+    expects `str | None`, the same discipline `parse_added` applies to a raw title."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "sent": {}, "cached": {},
+        "pending_greetings": {"-1": "fine", "-2": 42, "-3": None},
+    }))
+    assert load_state(path, NOW).pending_greetings == {"-1": "fine"}
+
+
+def test_polling_disabled_does_not_survive_a_save_and_load_round_trip(tmp_path):
+    """The behavioural version of the test above: even if a value did leak onto disk
+    somehow, loading it back must still come back False, since only a fresh process
+    (a restart) is allowed to re-enable polling."""
+    path = tmp_path / "state.json"
+    save_state(path, State(sent={}, cached={}, polling_disabled=True))
+    raw = json.loads(path.read_text())
+    assert "polling_disabled" not in raw
+    assert load_state(path, NOW).polling_disabled is False
