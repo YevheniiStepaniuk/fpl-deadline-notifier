@@ -1,0 +1,97 @@
+name: Deploy
+
+# Chained off CI rather than duplicating the test run. workflow_run fires when CI
+# finishes on any branch, so the job below filters twice: it must have succeeded, and it
+# must have been master. Without both, a red build or a feature branch would deploy.
+#
+# Note workflow_run always uses the workflow file from the default branch, and the
+# checkout below is pinned to the exact commit CI tested -- not to master's tip, which
+# may already have moved on.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+concurrency:
+  # One deploy at a time. Two overlapping runs would race on `docker rm -f` and could
+  # leave the VM with no container at all.
+  group: deploy-vm
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'master'
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_NAME: fpl-deadline-notifier
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The commit CI actually tested. Using master's tip instead would let an
+          # untested commit ride along if two landed close together.
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Log in to the registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: notifier/deploy/Dockerfile
+          push: true
+          # Two tags on purpose. The SHA tag is what the VM pulls, so a deploy names
+          # exactly one immutable image and a rollback is just an older SHA. `latest`
+          # is for humans reading the registry.
+          tags: |
+            ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.event.workflow_run.head_sha }}
+            ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy over SSH
+        env:
+          SSHPASS: ${{ secrets.VM_PASSWORD }}
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+          VM_PORT: ${{ secrets.VM_PORT || '22' }}
+          KNOWN_HOSTS: ${{ secrets.VM_KNOWN_HOSTS }}
+          ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+          IMAGE: ${{ secrets.ACR_LOGIN_SERVER }}/fpl-deadline-notifier:${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          if [ -n "${KNOWN_HOSTS}" ]; then
+            printf '%s\n' "${KNOWN_HOSTS}" > ~/.ssh/known_hosts
+          else
+            # Trust-on-first-use. Weaker than a pinned key: a machine-in-the-middle on
+            # the first connection would be accepted. Set VM_KNOWN_HOSTS to close it --
+            # `ssh-keyscan -p PORT HOST` on a machine you trust prints the value.
+            echo "::warning::VM_KNOWN_HOSTS is not set; falling back to ssh-keyscan"
+            ssh-keyscan -p "${VM_PORT}" -H "${VM_HOST}" > ~/.ssh/known_hosts 2>/dev/null
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+          # Everything -- the variables and the script -- goes over stdin. Passing them
+          # as `ssh host VAR=x bash -s` instead would put the registry password on the
+          # remote command line, where any user on that box can read it out of `ps` for
+          # as long as the deploy runs. %q quotes each value so a password containing
+          # shell metacharacters cannot break out of the assignment.
+          {
+            printf 'export ACR_LOGIN_SERVER=%q\n' "${ACR_LOGIN_SERVER}"
+            printf 'export ACR_USERNAME=%q\n'     "${ACR_USERNAME}"
+            printf 'export ACR_PASSWORD=%q\n'     "${ACR_PASSWORD}"
+            printf 'export IMAGE=%q\n'            "${IMAGE}"
+            cat notifier/deploy/remote-deploy.sh
+          } | sshpass -e ssh -p "${VM_PORT}" "${VM_USER}@${VM_HOST}" 'bash -s'

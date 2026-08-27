@@ -1,0 +1,28 @@
+name: CI
+
+# Every push and every pull request. The deploy workflow keys off this one's
+# conclusion, so this is the gate: if it is red, nothing reaches the VM.
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches the floor in pyproject.toml. Pinned to a minor version rather than
+          # "3.x" so a new release cannot turn a green branch red without a commit.
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Test
+        # No network in these tests -- every outbound call is mocked with respx -- so a
+        # failure here is a real failure and never a flaky API.
+        run: pytest -q

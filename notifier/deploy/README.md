@@ -20,6 +20,78 @@ Check it:
 Exit 0 and a `data/notifier_state.json` listing both games means it is working. A
 `chat not found` error means step 3 was skipped.
 
+## Continuous deployment
+
+Two workflows. `ci.yml` runs the tests on every push and pull request. `deploy.yml`
+chains off it with `workflow_run` and only proceeds when CI **succeeded** *and* the
+branch was **master** — so a red build or a feature branch goes nowhere. It builds the
+image, pushes it to Azure Container Registry, and restarts the container on the VM over
+SSH.
+
+Deploys pin the **commit SHA**, not `latest`, so a rollback is a re-run against an older
+commit rather than a guess about what `latest` currently means.
+
+### Repository secrets
+
+| Secret | What it is |
+|---|---|
+| `ACR_LOGIN_SERVER` | e.g. `myregistry.azurecr.io` |
+| `ACR_USERNAME` | ACR admin user, or a service principal's app id |
+| `ACR_PASSWORD` | its password |
+| `VM_HOST` | hostname or IP of the VM |
+| `VM_USER` | SSH user |
+| `VM_PASSWORD` | that user's password |
+| `VM_PORT` | optional, defaults to `22` |
+| `VM_KNOWN_HOSTS` | optional but recommended — see below |
+
+Enable the registry admin user with
+`az acr update -n <registry> --admin-enabled true`, then read the credentials with
+`az acr credential show -n <registry>`.
+
+**`VM_KNOWN_HOSTS` is worth setting.** Without it the workflow falls back to
+`ssh-keyscan`, which trusts whatever answers on the first connection — a
+machine-in-the-middle at that moment would be accepted, and it would then hold your VM
+password. Generate the value on a machine you already trust:
+
+    ssh-keyscan -p 22 your.vm.host
+
+### What is deliberately *not* a GitHub secret
+
+The bot token, chat id and roster. Those live in `/opt/fpl-notifier/.env` on the VM and
+never pass through CI. GitHub needs enough to push an image and restart a container; it
+has no business holding the token the bot actually speaks with. Create that file from
+`.env.example` before the first deploy — the deploy script fails loudly if it is missing
+rather than starting a notifier that cannot send anything.
+
+### One-time VM setup
+
+    sudo mkdir -p /opt/fpl-notifier
+    sudo cp .env.example /opt/fpl-notifier/.env
+    sudo nano /opt/fpl-notifier/.env      # fill in the token and chat id
+    sudo chmod 600 /opt/fpl-notifier/.env
+
+The VM needs Docker, and the SSH user needs to be able to run it — either in the
+`docker` group or via passwordless sudo.
+
+### A note on password SSH
+
+Key-based authentication is the better choice: a key cannot be brute-forced or shoulder
+-surfed, and it can be scoped to this one deploy. This uses a password because that is
+what the setup called for, via `sshpass`. If you move to a key later, swap `VM_PASSWORD`
+for a `VM_SSH_KEY` secret and drop `sshpass` from the workflow — the rest is unchanged.
+
+### Migrating from a local compose deployment
+
+The compose file creates a volume named `deploy_notifier-state`; the deploy script uses
+`fpl-notifier-state`. If you are moving an existing deployment and want to keep its
+record of which alerts have already been sent, copy the data across first:
+
+    docker run --rm -v deploy_notifier-state:/from -v fpl-notifier-state:/to \
+      alpine sh -c "cp -a /from/. /to/"
+
+Skip it and the first tick treats every past alert as stale and retires it silently —
+no burst of late messages, just a fresh start.
+
 ## systemd
 
 Copy `fpl-notifier.service` to `/etc/systemd/system/`, replace every `CHANGEME`, then:
