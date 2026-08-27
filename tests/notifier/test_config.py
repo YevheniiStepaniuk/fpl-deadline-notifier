@@ -68,18 +68,20 @@ def test_a_non_numeric_interval_is_named_in_the_error():
 
 
 def test_the_owners_roster_parses_into_four_paired_members():
-    """The exact value the owner will actually set NOTIFIER_ROSTER to."""
+    """The exact three-field value the owner will actually set NOTIFIER_ROSTER to."""
     cfg = load_config(MINIMAL | {
         "NOTIFIER_ROSTER": (
-            "@alice_fpl:Chelsea,@bob_fpl:Manchester United,"
-            "@carol_fpl:Liverpool,@dave_fpl:Arsenal"
+            "@thecouriersix:Yevhenii Stepaniuk:Chelsea,"
+            "@romanusyk:Roman Usyk:Manchester United,"
+            "@just_yuricle:Yurii Krat:Liverpool,"
+            "@d_vodotiiets:Denys Vodotyets:Arsenal"
         ),
     })
     assert cfg.roster == (
-        RosterMember("@alice_fpl", "Chelsea"),
-        RosterMember("@bob_fpl", "Manchester United"),
-        RosterMember("@carol_fpl", "Liverpool"),
-        RosterMember("@dave_fpl", "Arsenal"),
+        RosterMember("@thecouriersix", "Yevhenii Stepaniuk", "Chelsea"),
+        RosterMember("@romanusyk", "Roman Usyk", "Manchester United"),
+        RosterMember("@just_yuricle", "Yurii Krat", "Liverpool"),
+        RosterMember("@d_vodotiiets", "Denys Vodotyets", "Arsenal"),
     )
 
 
@@ -89,11 +91,21 @@ def test_an_unset_roster_is_the_empty_tuple_not_an_error():
     assert load_config(MINIMAL | {"NOTIFIER_ROSTER": ""}).roster == ()
 
 
+def test_the_old_two_field_roster_form_still_parses_with_empty_fpl_name():
+    """A container in production right now has this exact two-field form in its
+    .env -- load_config must keep accepting it, not just parse_roster in isolation."""
+    cfg = load_config(MINIMAL | {"NOTIFIER_ROSTER": "@bob_fpl:Manchester United"})
+    assert cfg.roster == (RosterMember("@bob_fpl", "", "Manchester United"),)
+
+
 def test_a_malformed_roster_entry_is_skipped_without_refusing_to_start():
     """Tolerant parsing at the config layer too, not just in parse_roster's own
     tests -- this is the path load_config actually calls."""
     cfg = load_config(MINIMAL | {"NOTIFIER_ROSTER": "@good:Team,no-colon-here,@also:Fine"})
-    assert cfg.roster == (RosterMember("@good", "Team"), RosterMember("@also", "Fine"))
+    assert cfg.roster == (
+        RosterMember("@good", "", "Team"),
+        RosterMember("@also", "", "Fine"),
+    )
 
 
 @pytest.mark.parametrize("value", ["on", "ON", " on ", ""])
