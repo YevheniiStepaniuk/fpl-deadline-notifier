@@ -19,8 +19,8 @@ class RosterMember:
     """One mate: the handle a line addresses, and the club that comes with them.
 
     A pair, not two independent fields picked apart -- `{name}` and `{team}` in a
-    line always come from the *same* member, or "@romanusyk trusting Liverpool
-    again" replaces "@romanusyk trusting Manchester United again" and the joke (that
+    line always come from the *same* member, or "@bob_fpl trusting Liverpool
+    again" replaces "@bob_fpl trusting Manchester United again" and the joke (that
     it is *his* team) is gone.
     """
 

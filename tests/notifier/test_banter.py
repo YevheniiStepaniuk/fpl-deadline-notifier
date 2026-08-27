@@ -20,10 +20,10 @@ from notifier.banter import (
 )
 
 ROSTER = (
-    RosterMember("@thecouriersix", "Chelsea"),
-    RosterMember("@romanusyk", "Manchester United"),
-    RosterMember("@just_yuricle", "Liverpool"),
-    RosterMember("@d_vodotiiets", "Arsenal"),
+    RosterMember("@alice_fpl", "Chelsea"),
+    RosterMember("@bob_fpl", "Manchester United"),
+    RosterMember("@carol_fpl", "Liverpool"),
+    RosterMember("@dave_fpl", "Arsenal"),
 )
 
 
@@ -40,8 +40,8 @@ def _cycle_rand(*indices):
 
 def test_parse_roster_reads_the_owners_real_value():
     raw = (
-        "@thecouriersix:Chelsea,@romanusyk:Manchester United,"
-        "@just_yuricle:Liverpool,@d_vodotiiets:Arsenal"
+        "@alice_fpl:Chelsea,@bob_fpl:Manchester United,"
+        "@carol_fpl:Liverpool,@dave_fpl:Arsenal"
     )
     assert parse_roster(raw) == ROSTER
 
@@ -109,8 +109,8 @@ def test_name_and_team_always_come_from_the_same_roster_entry():
     text, _used, target = next_banter(
         frozenset(), None, ROSTER, _cycle_rand(line_index, 1)
     )
-    assert text == "@romanusyk trusting Manchester United again. Bold."
-    assert target == "@romanusyk"
+    assert text == "@bob_fpl trusting Manchester United again. Bold."
+    assert target == "@bob_fpl"
 
 
 @pytest.mark.parametrize("line_id", [line.id for line in LINES if line.needs_team])

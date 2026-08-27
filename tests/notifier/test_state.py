@@ -383,11 +383,11 @@ def test_a_fresh_state_defaults_the_banter_fields_too():
 def test_banter_state_round_trips(tmp_path):
     path = tmp_path / "state.json"
     save_state(path, State(
-        sent={}, cached={}, banter_used=frozenset({"3", "7"}), banter_last_target="@romanusyk",
+        sent={}, cached={}, banter_used=frozenset({"3", "7"}), banter_last_target="@bob_fpl",
     ))
     restored = load_state(path, NOW)
     assert restored.banter_used == frozenset({"3", "7"})
-    assert restored.banter_last_target == "@romanusyk"
+    assert restored.banter_last_target == "@bob_fpl"
 
 
 def test_banter_used_is_saved_as_a_sorted_list_not_a_set(tmp_path):
@@ -400,9 +400,9 @@ def test_banter_used_is_saved_as_a_sorted_list_not_a_set(tmp_path):
 
 
 def test_load_banter_state_round_trips_a_good_pair():
-    used, target = load_banter_state(["3", "7"], "@romanusyk")
+    used, target = load_banter_state(["3", "7"], "@bob_fpl")
     assert used == frozenset({"3", "7"})
-    assert target == "@romanusyk"
+    assert target == "@bob_fpl"
 
 
 def test_load_banter_state_round_trips_no_target():

@@ -71,15 +71,15 @@ def test_the_owners_roster_parses_into_four_paired_members():
     """The exact value the owner will actually set NOTIFIER_ROSTER to."""
     cfg = load_config(MINIMAL | {
         "NOTIFIER_ROSTER": (
-            "@thecouriersix:Chelsea,@romanusyk:Manchester United,"
-            "@just_yuricle:Liverpool,@d_vodotiiets:Arsenal"
+            "@alice_fpl:Chelsea,@bob_fpl:Manchester United,"
+            "@carol_fpl:Liverpool,@dave_fpl:Arsenal"
         ),
     })
     assert cfg.roster == (
-        RosterMember("@thecouriersix", "Chelsea"),
-        RosterMember("@romanusyk", "Manchester United"),
-        RosterMember("@just_yuricle", "Liverpool"),
-        RosterMember("@d_vodotiiets", "Arsenal"),
+        RosterMember("@alice_fpl", "Chelsea"),
+        RosterMember("@bob_fpl", "Manchester United"),
+        RosterMember("@carol_fpl", "Liverpool"),
+        RosterMember("@dave_fpl", "Arsenal"),
     )
 
 
