@@ -12,7 +12,9 @@ import respx
 from notifier.__main__ import (
     main, run_once, _append_banter, _greet, _log_reschedules, _should_refresh,
 )
-from notifier.banter import LINES
+from notifier.ai_banter import OPENROUTER_URL
+from notifier.banter import LINES, RosterMember
+from notifier.league import FPL_API as LEAGUE_FPL_API
 from notifier.config import Config
 from notifier.sources import DRAFT_URL, FPL_URL, Moment
 from notifier.state import KEEP_PENDING_FOR, State, encode_pending_greeting, load_state, save_state
@@ -25,6 +27,11 @@ UPDATES_URL = api_url(TOKEN, "getUpdates")
 OK = {"ok": True, "result": {"message_id": 1}}
 
 DEADLINE = datetime.datetime(2026, 8, 28, 17, 30, tzinfo=datetime.UTC)
+NOW = DEADLINE - datetime.timedelta(hours=2)
+
+# The AI banter tests below inject this where production passes random.randrange, the
+# same way every other rule in this codebase gets a deterministic stand-in.
+_fixed_rand = lambda n: 0
 
 
 def _added_update(update_id, chat_id, chat_type="channel", title=None):
@@ -1065,3 +1072,169 @@ def test_a_failing_banter_picker_does_not_stop_the_scheduled_alert_end_to_end(tm
     text = json.loads(send.calls[0].request.read())["text"]
     assert text == "⏰ GW2 deadline in 2 hours\nFPL + Draft · Fri 28 Aug, 18:30 BST"
     assert "deadline:2:fpl:2" in state.sent  # the alert itself still went through and was recorded
+
+
+# ------------------------------------------------------- the AI banter's wiring only
+#
+# The rules the AI banter follows -- who gets targeted, what the prompt says, what a
+# usable completion looks like -- are all pure and tested in test_ai_banter.py against
+# injected data. What is left for this file is the wiring: that an AI line is preferred
+# when one is configured and available, that every way of failing falls back to the
+# static lines rather than costing the alert, and that the cooldown is honoured.
+
+CLASSIC_STANDINGS = {
+    "league": {"id": 42, "name": "The Office"},
+    "standings": {"results": [
+        {"entry": 11, "player_name": "Nils Berg", "entry_name": "Just Bergs",
+         "rank": 1, "event_total": 78, "total": 78},
+        {"entry": 22, "player_name": "Rex Marlow", "entry_name": "Rocket FC",
+         "rank": 2, "event_total": 61, "total": 61},
+    ]},
+}
+
+
+def _ai_cfg(tmp_path, **overrides):
+    fields = {
+        "banter_enabled": True,
+        "roster": (RosterMember("@just_bergs", "Liverpool"),),
+        "fpl_league_id": 42,
+        "openrouter_key": "sk-test",
+        "openrouter_model": "test/model",
+    }
+    fields.update(overrides)
+    return _cfg(tmp_path, **fields)
+
+
+def _mock_league(standings=None):
+    """The classic league endpoints. Draft is left unconfigured in these tests: one
+    game is enough to prove the wiring, and mocking both doubles the noise."""
+    respx.get(f"{LEAGUE_FPL_API}/leagues-classic/42/standings/").mock(
+        return_value=httpx.Response(200, json=standings or CLASSIC_STANDINGS)
+    )
+    respx.get(f"{LEAGUE_FPL_API}/bootstrap-static/").mock(
+        return_value=httpx.Response(200, json=_fixture("fpl_bootstrap"))
+    )
+    respx.get(url__regex=rf"{LEAGUE_FPL_API}/entry/\d+/transfers/").mock(
+        return_value=httpx.Response(200, json=[
+            {"event": 1, "element_in": 1, "element_out": 2, "time": "2026-08-27T08:00:00Z"}
+        ])
+    )
+
+
+def _mock_openrouter(line="Sold Haaland. Genuinely inspired stuff."):
+    return respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json={"choices": [{"message": {"content": line}}]})
+    )
+
+
+@respx.mock
+def test_an_ai_line_is_preferred_over_the_static_ones(tmp_path):
+    _mock_league()
+    _mock_openrouter()
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        text = _append_banter(_ai_cfg(tmp_path), state, _fixed_rand, client=client, now=NOW)
+    assert text == "Sold Haaland. Genuinely inspired stuff."
+    # Not one of the twenty, and the cooldown stamp and target were both recorded.
+    assert text not in {line.text for line in LINES}
+    assert state.banter_ai_last_at == NOW
+    assert state.banter_last_target == "@just_bergs"
+    # The static cycle was not advanced -- the two paths keep separate bookkeeping.
+    assert state.banter_used == frozenset()
+
+
+@respx.mock
+def test_a_failing_openrouter_falls_back_to_a_static_line(tmp_path):
+    _mock_league()
+    respx.post(OPENROUTER_URL).mock(return_value=httpx.Response(402, json={"error": "no credit"}))
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        text = _append_banter(_ai_cfg(tmp_path), state, _fixed_rand, client=client, now=NOW)
+    assert text is not None
+    assert state.banter_used != frozenset()   # a static line was picked instead
+    assert state.banter_ai_last_at is None    # nothing was spent, so nothing is owed
+
+
+@respx.mock
+def test_a_failing_league_api_falls_back_to_a_static_line(tmp_path):
+    respx.get(f"{LEAGUE_FPL_API}/leagues-classic/42/standings/").mock(
+        return_value=httpx.Response(503)
+    )
+    openrouter = _mock_openrouter()
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        text = _append_banter(_ai_cfg(tmp_path), state, _fixed_rand, client=client, now=NOW)
+    assert text is not None
+    assert state.banter_used != frozenset()
+    assert not openrouter.called  # never prompt a model with no data
+
+
+@respx.mock
+def test_the_cooldown_keeps_a_second_line_static(tmp_path):
+    """/nextdeadline is answerable by anyone in the group chat, so an uncapped AI line
+    is somebody else's OpenRouter bill."""
+    _mock_league()
+    openrouter = _mock_openrouter()
+    state = State(sent={}, cached={}, banter_ai_last_at=NOW - datetime.timedelta(minutes=1))
+    with httpx.Client() as client:
+        text = _append_banter(_ai_cfg(tmp_path), state, _fixed_rand, client=client, now=NOW)
+    assert text is not None
+    assert not openrouter.called
+    assert state.banter_used != frozenset()
+
+
+@respx.mock
+def test_no_key_or_league_means_no_ai_call_at_all(tmp_path):
+    openrouter = _mock_openrouter()
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        text = _append_banter(
+            _ai_cfg(tmp_path, openrouter_key=""), state, _fixed_rand, client=client, now=NOW
+        )
+    assert text is not None
+    assert not openrouter.called
+
+
+@respx.mock
+def test_banter_off_beats_a_fully_configured_ai(tmp_path):
+    """One switch for the whole feature, not a static line quietly replaced."""
+    openrouter = _mock_openrouter()
+    state = State(sent={}, cached={})
+    with httpx.Client() as client:
+        assert _append_banter(
+            _ai_cfg(tmp_path, banter_enabled=False), state, _fixed_rand, client=client, now=NOW
+        ) is None
+    assert not openrouter.called
+
+
+@respx.mock
+def test_a_scheduled_alert_carries_the_ai_line_end_to_end(tmp_path):
+    _mock_apis()
+    _mock_league()
+    _mock_openrouter("Third in a four-man league. Impressive commitment to the bit.")
+    send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    state = State(sent={}, cached={})
+    now = DEADLINE - datetime.timedelta(hours=2)
+    with httpx.Client() as client:
+        run_once(_ai_cfg(tmp_path), client, state, now, refresh=True)
+    body = json.loads(send.calls[0].request.read())
+    assert "Third in a four-man league" in body["text"]
+    assert "deadline" in body["text"].lower()
+
+
+@respx.mock
+def test_an_ai_banter_failure_does_not_stop_the_alert(tmp_path):
+    """The AI path has its own broad except for the same reason the static picker does:
+    an alert must never be lost to a joke. Here the failure is inside the module, not
+    at the network edge, so nothing mocked would have caught it."""
+    _mock_apis()
+    _mock_league()
+    respx.post(OPENROUTER_URL).mock(side_effect=httpx.ConnectError("openrouter down"))
+    send = respx.post(SEND_URL).mock(return_value=httpx.Response(200, json=OK))
+    state = State(sent={}, cached={})
+    now = DEADLINE - datetime.timedelta(hours=2)
+    with httpx.Client() as client:
+        run_once(_ai_cfg(tmp_path), client, state, now, refresh=True)
+    assert send.called
+    body = json.loads(send.calls[0].request.read())
+    assert "deadline" in body["text"].lower()

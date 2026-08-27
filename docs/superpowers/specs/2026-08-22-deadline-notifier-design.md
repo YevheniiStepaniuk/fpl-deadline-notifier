@@ -344,3 +344,112 @@ they are here so the next reader does not have to rediscover them.
   so following it automatically is possible and was deliberately not built: the deployment this was
   written for uses a basic group nobody is changing. If alerts ever stop for no visible reason,
   check whether the group was upgraded and update `TELEGRAM_CHAT_ID`.
+
+## Addendum: AI banter from live league state (2026-08-27)
+
+The banter above is twenty fixed lines. This adds a second source for the same one-line
+slot: a line written per alert from the mini-league's actual state.
+
+**Data.** `league.py` fetches, by league id, from endpoints all confirmed answering
+unauthenticated on 2026-08-27:
+
+| Endpoint | Gives |
+|---|---|
+| `/api/leagues-classic/{id}/standings/` | classic table |
+| `/api/entry/{id}/transfers/` | one manager's transfers, all season |
+| `/api/league/{id}/details` | draft table, entries, H2H record |
+| `/api/draft/league/{id}/transactions` | every waiver and free-agent move in the league |
+
+The draft *per-entry* transactions endpoint answers 403 without a session cookie; the
+league-level one carries the same moves for everybody and needs no login, which is why
+it is the one used. Classic publishes transfers per entry, so a table of N costs N
+requests — capped at `MAX_TRANSFER_FETCHES = 12`, since a mini-league of mates is far
+under it and a pasted overall-leaderboard id would otherwise be hundreds of requests.
+Ten most recent moves survive per league.
+
+**Rejected waiver claims are kept deliberately.** Being outbid on a waiver is the most
+mockable thing either API publishes, and the prompt marks them `REJECTED` explicitly —
+a model given only the move cannot tell it failed.
+
+**Aliases.** `NOTIFIER_BANTER_ALIASES` is comma-separated `@handle=Manager Name`
+(equals rather than colon: a colon inside a football-website display name is likelier
+than an equals sign). Linked in two passes — exact on the normalised full name, then a
+single shared word of four letters or more — so a configured "Tomas Harington" still
+finds the API's "Tomas Harrington", while two mates sharing a first name resolve to
+whoever spelled the surname the API's way. A configured alias always beats a letter-match
+guess.
+
+**Target.** `ai_banter.choose_target` picks one manager at random from the live table,
+never the same one twice running, deduplicated across the two games so whoever plays
+both is not twice as likely to be picked. A roster handle is used to address them when
+`link_roster` can match it to their manager or team name (so the mention notifies them);
+otherwise their API name is used. Matching is on letters only and conservative on
+purpose: a wrong link aims a personal joke at the wrong person and tags them in it.
+There is deliberately no config mapping handles to entry ids.
+
+**Two id spaces, one person.** The games issue a manager a *different* entry id, and
+each keys its moves by its own. `Target.entries` therefore holds one `(game, entry)` pair
+per game and `describe` resolves per snapshot. Getting this wrong is not cosmetic: with a
+single id, a real league's target had their own rejected waiver printed under "other
+managers' moves" while the prompt asserted they had made no moves at all.
+
+**Draft PL scores two ways.** `league.scoring` is `"h"` (head-to-head) or `"c"`
+(classic). The standings key `total` means league points in the first and accumulated
+score in the second, and the H2H keys (`matches_won`, `points_for`) are simply absent
+from a classic-scoring league, and real ones are out there. `parse_draft_table` branches on the
+payload's own `scoring`, and `describe` labels the league accordingly, so a model is
+never invited to be rude about a fixture that was never played.
+
+**Failure handling.** Every path degrades to the twenty fixed lines: no key, no league
+id, `NOTIFIER_BANTER_AI=off`, a league API down, no usable table, OpenRouter refusing or
+out of credit, a reply in an unexpected shape, an empty completion. `__main__._ai_banter`
+holds one broad `except` for the same reason `_append_banter` does — an alert must never
+be lost to a joke — and mutates `state` only once a line exists, so a failure costs a
+punchline and not the cooldown or the target rotation.
+
+**Cost.** `ai_banter.COOLDOWN` is 15 minutes, persisted as `banter_ai_last_at` so a
+deploy's restart cannot reset the budget. Four alerts a gameweek would not need it;
+`/nextdeadline` would, since anyone in the chat can type it and the operator pays.
+
+**Model choice.** `NOTIFIER_BANTER_MODEL` overrides the shared `OPENROUTER_MODEL` so
+the banter and the dashboard's prose can differ. Every request carries
+`reasoning: {enabled: false}`; measured on 2026-08-27 against
+`deepseek/deepseek-v4-pro-0813`:
+
+| | reasoning tokens | cost per line |
+|---|---|---|
+| default | 349–784 | $0.0015–$0.0027 |
+| `reasoning: {enabled: false}` | 0 | ~$0.0002 |
+
+The key was `anthropic/claude-sonnet-5` and `openai/gpt-4o-mini` both answering 200 with
+the same flag set — OpenRouter drops it for models with no such mode, so it is sent
+unconditionally rather than per-model. `MAX_TOKENS = 300` for the same reason a
+reasoning model needs it: thinking bills against the budget before the line is written,
+and at 200 that model returned `content: null` having spent all of it.
+
+### Known limitations of this part
+
+- **Nobody's transfers are visible before their first one.** Classic publishes transfers
+  per entry and returns `[]` until a move is made, so the first alert of a season has
+  only the table to work from. The prompt says so explicitly rather than leaving the
+  model to guess.
+- **The classic table is page one only.** `standings.results` is paginated at 50 and the
+  next page is not fetched. A mini-league is well under that; a large league is roasted
+  about its top 50.
+- **An unmapped handle with no textual relation to its owner's name still cannot be
+  linked.** `NOTIFIER_BANTER_ALIASES` closes this for anyone configured; without an entry
+  the guess is whole-string then per-word against manager and team name, which catches
+  `@rexmarlow`/"Rex Marlow" but not `@nine_iron`/"Ada Lovelace". Unmapped and
+  unmatched, they are still roasted — by API name, with no mention.
+- **An alias maps to a name, not an id, so a rename breaks it.** A manager who changes
+  the name on their FPL account silently loses their mention until the variable is
+  updated. Taken deliberately: the name is on the page the operator is already reading,
+  while the entry id has to be dug out of an API response.
+- **A reasoning model can still return nothing.** `reasoning: {enabled: false}` is a
+  request, not a guarantee, and a model that ignores it can spend `MAX_TOKENS` thinking
+  and answer `content: null`. That path raises `BanterError` carrying the finish reason
+  and usage, falls back to the fixed lines, and is not retried — the fix is a setting,
+  not another call.
+- **The model can still misread its own facts.** Observed in testing: an out-player
+  named as the winner of a waiver the target lost. The prompt bans invented facts, and
+  nothing verifies the joke against the data it was given.

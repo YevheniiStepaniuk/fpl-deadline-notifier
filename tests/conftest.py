@@ -2,7 +2,11 @@ import os
 
 import pytest
 
-_OWNED_PREFIXES = ("TELEGRAM_", "NOTIFIER_")
+# OPENROUTER_ is in here despite not being this project's own prefix: config.py
+# reads OPENROUTER_API_KEY/OPENROUTER_MODEL (shared with the dashboard this was
+# extracted from, one key in one .env), and a developer with either exported would
+# otherwise have `load_config()` pick up a real, spendable key mid-test-run.
+_OWNED_PREFIXES = ("TELEGRAM_", "NOTIFIER_", "OPENROUTER_")
 
 
 @pytest.fixture(autouse=True, scope="session")
