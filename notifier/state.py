@@ -79,6 +79,11 @@ class State:
     # banter.next_banter needs this to enforce "never the same target twice in a
     # row" across a restart, not just within one process's lifetime.
     banter_last_target: str | None = None
+    # When the last AI banter line was generated, or None if none has been. Persisted
+    # because the cooldown it feeds (ai_banter.COOLDOWN) exists to bound spend on a
+    # paid API, and a restart -- which a deploy does on every push -- must not reset
+    # the budget. Stored as a datetime here and an ISO string on disk.
+    banter_ai_last_at: datetime.datetime | None = None
 
 
 def _moment_to_json(moment: Moment) -> dict:
@@ -218,6 +223,27 @@ def prune_pending_greetings(raw: object, now: datetime.datetime) -> dict[str, st
     return pending
 
 
+def load_banter_ai_last_at(raw: object) -> datetime.datetime | None:
+    """Restore the AI cooldown stamp, or None when it is missing or unusable.
+
+    Coarse in the same way `load_banter_state` is, but the failure direction matters
+    here: an unreadable stamp reads as "no AI line yet", which permits one call
+    immediately. That is the right way round -- the alternative (treating a bad stamp
+    as "just now") would let a corrupt state file switch the feature off silently for
+    as long as nobody noticed.
+    """
+    if not isinstance(raw, str):
+        return None
+    try:
+        value = datetime.datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    # A naive stamp cannot be compared against the aware `now` this codebase passes
+    # everywhere, and would raise from inside ai_allowed. Assume UTC, which is what
+    # save_state writes.
+    return value if value.tzinfo else value.replace(tzinfo=datetime.UTC)
+
+
 def load_banter_state(raw_used: object, raw_last_target: object) -> tuple[frozenset[str], str | None]:
     """Restore `banter_used`/`banter_last_target`, or start a fresh cycle.
 
@@ -279,6 +305,7 @@ def load_state(path: pathlib.Path, now: datetime.datetime) -> State:
         # comment on State. Every fresh load starts able to poll again.
         banter_used=banter_used,
         banter_last_target=banter_last_target,
+        banter_ai_last_at=load_banter_ai_last_at(raw.get("banter_ai_last_at")),
     )
 
 
@@ -299,6 +326,9 @@ def save_state(path: pathlib.Path, state: State) -> None:
         # stable on-disk order keeps the file's diffs sane across saves.
         "banter_used": sorted(state.banter_used),
         "banter_last_target": state.banter_last_target,
+        "banter_ai_last_at": (
+            state.banter_ai_last_at.isoformat() if state.banter_ai_last_at else None
+        ),
     }
     # Write and rename, so a crash mid-write leaves the previous file intact rather
     # than a truncated one. The temp sits in the same directory to keep the rename on

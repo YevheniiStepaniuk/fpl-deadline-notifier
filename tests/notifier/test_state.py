@@ -10,6 +10,7 @@ from notifier.state import (
     State,
     decode_pending_greeting,
     encode_pending_greeting,
+    load_banter_ai_last_at,
     load_banter_state,
     load_state,
     save_state,
@@ -451,3 +452,47 @@ def test_polling_disabled_does_not_survive_a_save_and_load_round_trip(tmp_path):
     raw = json.loads(path.read_text())
     assert "polling_disabled" not in raw
     assert load_state(path, NOW).polling_disabled is False
+
+
+# ------------------------------------------------- the AI banter's cooldown timestamp
+
+
+def test_a_fresh_state_has_no_ai_banter_stamp():
+    assert State(sent={}, cached={}).banter_ai_last_at is None
+
+
+def test_the_ai_banter_stamp_round_trips(tmp_path):
+    """Persisted because the cooldown it feeds bounds spend on a paid API, and a deploy
+    restarts the process on every push."""
+    path = tmp_path / "state.json"
+    save_state(path, State(sent={}, cached={}, banter_ai_last_at=NOW))
+    assert load_state(path, NOW).banter_ai_last_at == NOW
+
+
+def test_the_ai_banter_stamp_is_written_as_a_string_not_an_object(tmp_path):
+    path = tmp_path / "state.json"
+    save_state(path, State(sent={}, cached={}, banter_ai_last_at=NOW))
+    assert json.loads(path.read_text())["banter_ai_last_at"] == NOW.isoformat()
+
+
+@pytest.mark.parametrize("raw", [None, 1735689600, "not a date", "", {"at": "x"}])
+def test_an_unusable_ai_banter_stamp_loads_as_none(raw):
+    """None permits a call immediately, which is the right direction to fail: the
+    alternative would let a corrupt file switch the feature off silently."""
+    assert load_banter_ai_last_at(raw) is None
+
+
+def test_a_naive_ai_banter_stamp_is_assumed_to_be_utc():
+    """Everything in this codebase compares against an aware `now`; a naive stamp from
+    a hand-edited file would otherwise raise from inside ai_allowed."""
+    loaded = load_banter_ai_last_at("2026-08-27T18:00:00")
+    assert loaded == datetime.datetime(2026, 8, 27, 18, 0, tzinfo=datetime.UTC)
+
+
+def test_a_corrupt_ai_banter_stamp_does_not_cost_the_rest_of_the_state(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"sent": {}, "cached": {}, "banter_ai_last_at": 42,
+                                "banter_used": ["7"], "banter_last_target": "@someone"}))
+    state = load_state(path, NOW)
+    assert state.banter_ai_last_at is None
+    assert state.banter_last_target == "@someone"

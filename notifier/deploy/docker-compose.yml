@@ -14,10 +14,10 @@ services:
     container_name: fpl-notifier
 
     # Named individually rather than with `env_file: .env`. That file also holds
-    # ANTHROPIC_API_KEY and OPENROUTER_API_KEY for the dashboard, and this service has
-    # no use for either -- there is no reason to put them inside a container that talks
-    # only to Telegram and the two Premier League APIs. `:?` fails the run with a named
-    # variable rather than starting a notifier that can never send anything.
+    # ANTHROPIC_API_KEY for the dashboard, which this service has no use for -- there is
+    # no reason to put it inside a container that talks only to Telegram, OpenRouter and
+    # the two Premier League APIs. `:?` fails the run with a named variable rather than
+    # starting a notifier that can never send anything.
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN in .env}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:?set TELEGRAM_CHAT_ID in .env}
@@ -31,6 +31,16 @@ services:
       # that need no roster. Add new NOTIFIER_* settings here as well as to .env.
       NOTIFIER_ROSTER: ${NOTIFIER_ROSTER:-}
       NOTIFIER_BANTER: ${NOTIFIER_BANTER:-on}
+      # The AI banter's four. Absent, the service still starts and still sends -- it
+      # just uses the twenty built-in lines, which is the same thing an unset key means
+      # anywhere else. OPENROUTER_API_KEY is the one secret here beyond the bot token.
+      NOTIFIER_FPL_LEAGUE_ID: ${NOTIFIER_FPL_LEAGUE_ID:-}
+      NOTIFIER_DRAFT_LEAGUE_ID: ${NOTIFIER_DRAFT_LEAGUE_ID:-}
+      NOTIFIER_BANTER_AI: ${NOTIFIER_BANTER_AI:-on}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-}
+      NOTIFIER_BANTER_MODEL: ${NOTIFIER_BANTER_MODEL:-}
+      NOTIFIER_BANTER_ALIASES: ${NOTIFIER_BANTER_ALIASES:-}
 
     # A named volume, not a bind mount. The container runs as uid 10001, and a bind
     # mount would arrive owned by the host user, so the first save would fail with

@@ -60,7 +60,9 @@ The shape, briefly:
 | `sources.py` | both official APIs → `Moment` | network in |
 | `schedule.py` | which alerts are owed | **pure** |
 | `render.py` | message text | **pure** |
-| `banter.py` | the mini-league sting | **pure** |
+| `banter.py` | the mini-league sting, twenty fixed lines | **pure** |
+| `league.py` | both leagues by id: table, transfers, waivers | network in |
+| `ai_banter.py` | the sting written from that, via OpenRouter | pure + one call |
 | `state.py` | one JSON file: sent keys, cache, greetings | filesystem |
 | `telegram.py` | one `sendMessage`, with retries | network out |
 | `updates.py` | `getUpdates`, adds and commands | network in |
@@ -68,6 +70,32 @@ The shape, briefly:
 
 Every rule worth arguing about lives in a pure function that takes `now` as an argument,
 which is why the tests need no clock and no mocking to pin the interesting cases.
+
+## Banter
+
+Each alert carries one line of banter. By default it comes from twenty fixed lines in
+`banter.py`, aimed at whoever is listed in `NOTIFIER_ROSTER`.
+
+Set `NOTIFIER_FPL_LEAGUE_ID` and/or `NOTIFIER_DRAFT_LEAGUE_ID` plus `OPENROUTER_API_KEY`
+and the line is written instead from the league's live state: the table, and every
+manager's latest transfers and waiver claims — including the waivers they *lost*, which
+is the most mockable thing either API publishes. One manager is picked at random, never
+the same one twice running. A roster handle is used to address them when it can be
+matched to their manager or team name (whole-string, then per surname), or when
+`NOTIFIER_BANTER_ALIASES` maps the handle to the name outright — needed for a handle that
+shares no letters with its owner, which is most of them. Unmapped and unmatched, the
+line uses their name off the API and nobody gets a notification.
+
+`NOTIFIER_BANTER_MODEL` picks the model for this and this only, so it can differ from
+the dashboard's `OPENROUTER_MODEL`. Requests send `reasoning: {enabled: false}` —
+ignored by models without a reasoning mode, and on one that has it the difference is
+$0.0002 a line against $0.0027, for a joke that gains nothing from deliberation.
+
+The AI path is decoration on top of decoration: no key, no league id, a league API
+down, OpenRouter out of credit, a reply in the wrong shape — every one of them falls
+back to the twenty lines, and none of them can cost the alert. A line is asked for at
+most once every 15 minutes (`ai_banter.COOLDOWN`), because anyone in the chat can type
+`/nextdeadline` and it is the operator who pays.
 
 ## History
 

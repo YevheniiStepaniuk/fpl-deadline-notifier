@@ -18,6 +18,7 @@ from collections.abc import Callable, Iterable, Sequence
 
 import httpx
 
+from notifier.ai_banter import ai_allowed, choose_target, generate_line
 from notifier.banter import next_banter
 
 # `config` is imported as a module, not unpacked with `from ... import`, and the
@@ -28,7 +29,7 @@ from notifier.banter import next_banter
 # load_config actually raises, and `except ConfigError` silently stops catching. It
 # fails only when both test modules run together, which is the worst way to find out.
 # Resolving through the module object looks the name up at call time instead.
-from notifier import config, sources
+from notifier import config, league, sources
 from notifier.render import format_intro, format_message, format_next
 from notifier.schedule import Alert, due_alerts
 from notifier.sources import Moment
@@ -128,15 +129,76 @@ def _record(state: State, alerts: Iterable[Alert]) -> None:
             state.sent[key] = stamp
 
 
+def _ai_banter(
+    cfg: config.Config,
+    client: httpx.Client,
+    state: State,
+    now: datetime.datetime,
+    rand: Callable[[int], int],
+) -> str | None:
+    """An AI line written from live league data, or None to fall back to the static
+    lines. Never raises.
+
+    Three ways to get None before any network happens: the AI variant is not configured
+    (`ai_banter_ready` -- no key, no league id, or switched off), the cooldown has not
+    elapsed, or neither league answered. None of those is an error: they are all "use
+    the twenty lines instead", which is the behaviour this service shipped with.
+
+    `state` is only mutated once a line exists. A snapshot fetch or a model call that
+    dies leaves the cooldown stamp and the last target untouched, so the next alert
+    tries again rather than skipping its turn -- the same discipline `_append_banter`
+    applies to the static picker's cycle position.
+    """
+    if not cfg.ai_banter_ready:
+        return None
+    if not ai_allowed(state.banter_ai_last_at, now):
+        log.info("AI banter skipped: within the cooldown since %s", state.banter_ai_last_at)
+        return None
+    try:
+        snapshots = league.fetch_snapshots(client, cfg.fpl_league_id, cfg.draft_league_id)
+        if not snapshots:
+            log.warning("AI banter skipped: no league snapshot came back")
+            return None
+        target = choose_target(snapshots, cfg.roster, state.banter_last_target, rand, cfg.aliases)
+        if target is None:
+            log.warning("AI banter skipped: no league row worth targeting")
+            return None
+        text = generate_line(
+            client, cfg.openrouter_key, cfg.openrouter_model, snapshots, target, now
+        )
+    except Exception as exc:
+        # Broad on purpose, and for the same reason as `_append_banter`'s: this is
+        # decoration on a message that must go out. A new failure mode in OpenRouter,
+        # in either league API, or in this module costs a punchline and a log line.
+        log.error("AI banter failed, falling back to the static lines: %s", exc)
+        return None
+    log.info(
+        "AI banter about %s (%s), latest move in the prompt: %s",
+        target.label,
+        target.game,
+        league.freshest_move_time(snapshots),
+    )
+    state.banter_ai_last_at = now
+    state.banter_last_target = target.key
+    return text
+
+
 def _append_banter(
     cfg: config.Config,
     state: State,
     rand: Callable[[int], int] = random.randrange,
+    client: httpx.Client | None = None,
+    now: datetime.datetime | None = None,
 ) -> str | None:
     """One rendered banter line to append, or None if there is nothing to append --
     banter is off, or picking one failed. `rand` defaults to real randomness in
     production; tests inject a deterministic stand-in, the same pattern `now` uses
     everywhere else in this module.
+
+    `client`/`now` are optional and only enable the AI line: given both, a line written
+    from live league data is tried first and the static picker below is the fallback.
+    They are keyword-defaulted rather than required so every existing call site -- and
+    every existing test -- keeps working and keeps getting exactly the static lines.
 
     This is the only place `next_banter` is called, and the whole body sits behind
     one broad except: banter is decoration on a message that must go out regardless,
@@ -149,6 +211,10 @@ def _append_banter(
     """
     if not cfg.banter_enabled:
         return None
+    if client is not None and now is not None:
+        text = _ai_banter(cfg, client, state, now, rand)
+        if text:
+            return text
     try:
         text, used, target = next_banter(state.banter_used, state.banter_last_target, cfg.roster, rand)
     except Exception as exc:
@@ -366,7 +432,7 @@ def _poll_and_greet(
         text = format_next(_next_moment(moments, now), now, cfg.tz)
         # Same separator as the scheduled alert, and the same reasoning: the answer
         # to "what's next" stays scannable at the top, the banter underneath it.
-        banter = _append_banter(cfg, state)
+        banter = _append_banter(cfg, state, client=client, now=now)
         if banter:
             text = f"{text}\n\n{banter}"
         try:
@@ -440,7 +506,7 @@ def run_once(
         # someone glancing at a notification actually needs -- stays visually
         # separate from the punchline underneath it rather than reading as one more
         # line of it.
-        banter = _append_banter(cfg, state)
+        banter = _append_banter(cfg, state, client=client, now=now)
         if banter:
             text = f"{text}\n\n{banter}"
         try:

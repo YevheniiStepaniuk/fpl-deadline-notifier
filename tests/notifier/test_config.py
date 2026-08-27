@@ -149,3 +149,119 @@ def test_config_reads_the_environment_when_called_not_when_imported(monkeypatch)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "set-after-import")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "1")
     assert notifier.config.load_config().bot_token == "set-after-import"
+
+
+# ------------------------------------------------------- the AI banter's own settings
+
+# These tests run after `test_config_reads_the_environment_when_called_not_when_imported`
+# reloads notifier.config, and a reload rebinds ConfigError to a *new* class while the
+# `load_config` imported at the top of this file keeps raising whatever the module dict
+# holds now -- the exact trap notifier/__main__.py documents. So both names are resolved
+# through the module at call time here rather than captured at import.
+def _load(env):
+    import notifier.config
+
+    return notifier.config.load_config(env)
+
+
+def _config_error():
+    import notifier.config
+
+    return notifier.config.ConfigError
+
+
+
+def test_ai_banter_is_unconfigured_by_default():
+    """A deployment that sets none of the new variables keeps exactly the behaviour it
+    had: the twenty static lines."""
+    cfg = _load(MINIMAL)
+    assert cfg.fpl_league_id is None
+    assert cfg.draft_league_id is None
+    assert cfg.openrouter_key == ""
+    assert cfg.openrouter_model == "anthropic/claude-sonnet-5"
+    assert cfg.ai_banter_enabled is True
+    assert cfg.ai_banter_ready is False
+
+
+def test_league_ids_are_read_as_numbers():
+    cfg = _load(MINIMAL | {"NOTIFIER_FPL_LEAGUE_ID": " 314 ", "NOTIFIER_DRAFT_LEAGUE_ID": "7"})
+    assert (cfg.fpl_league_id, cfg.draft_league_id) == (314, 7)
+
+
+@pytest.mark.parametrize("value", ["abc", "314/standings", "3.5", "-1", "0"])
+def test_a_bad_league_id_is_named_in_the_error(value):
+    """Strict rather than tolerant: this is the operator's own number copied from a URL,
+    and a silently ignored typo means the feature never fires with no clue why."""
+    with pytest.raises(_config_error()) as excinfo:
+        _load(MINIMAL | {"NOTIFIER_FPL_LEAGUE_ID": value})
+    assert "NOTIFIER_FPL_LEAGUE_ID" in str(excinfo.value)
+
+
+def test_openrouter_model_can_be_overridden():
+    cfg = _load(MINIMAL | {"OPENROUTER_MODEL": "openai/gpt-4o-mini"})
+    assert cfg.openrouter_model == "openai/gpt-4o-mini"
+
+
+def test_the_banter_model_override_wins_over_the_shared_one():
+    """Otherwise choosing a model for a one-line joke also repoints the dashboard's
+    prose, which reads the same shared variable."""
+    env = MINIMAL | {"OPENROUTER_MODEL": "anthropic/claude-sonnet-5",
+                     "NOTIFIER_BANTER_MODEL": "deepseek/deepseek-v4-pro-0813"}
+    assert _load(env).openrouter_model == "deepseek/deepseek-v4-pro-0813"
+
+
+def test_a_blank_banter_model_override_falls_through_to_the_shared_one():
+    env = MINIMAL | {"OPENROUTER_MODEL": "openai/gpt-4o-mini", "NOTIFIER_BANTER_MODEL": "  "}
+    assert _load(env).openrouter_model == "openai/gpt-4o-mini"
+
+
+def test_a_blank_openrouter_model_falls_back_to_the_default():
+    assert _load(MINIMAL | {"OPENROUTER_MODEL": "   "}).openrouter_model == "anthropic/claude-sonnet-5"
+
+
+AI_READY = {"OPENROUTER_API_KEY": "sk-test", "NOTIFIER_FPL_LEAGUE_ID": "42"}
+
+
+def test_ai_banter_ready_needs_a_key_and_a_league():
+    assert _load(MINIMAL | AI_READY).ai_banter_ready is True
+    assert _load(MINIMAL | {"OPENROUTER_API_KEY": "sk-test"}).ai_banter_ready is False
+    assert _load(MINIMAL | {"NOTIFIER_FPL_LEAGUE_ID": "42"}).ai_banter_ready is False
+
+
+def test_a_draft_league_alone_is_enough():
+    env = MINIMAL | {"OPENROUTER_API_KEY": "sk-test", "NOTIFIER_DRAFT_LEAGUE_ID": "7"}
+    assert _load(env).ai_banter_ready is True
+
+
+@pytest.mark.parametrize("value", ["off", "OFF", " Off "])
+def test_banter_ai_off_is_honoured(value):
+    assert _load(MINIMAL | AI_READY | {"NOTIFIER_BANTER_AI": value}).ai_banter_ready is False
+
+
+def test_banter_off_switches_off_the_ai_variant_too():
+    """One switch for the whole feature: NOTIFIER_BANTER=off means no line at all, not
+    a static line replaced by an AI one."""
+    assert _load(MINIMAL | AI_READY | {"NOTIFIER_BANTER": "off"}).ai_banter_ready is False
+
+
+def test_an_unrecognised_banter_ai_value_is_named_in_the_error():
+    with pytest.raises(_config_error()) as excinfo:
+        _load(MINIMAL | {"NOTIFIER_BANTER_AI": "maybe"})
+    assert "NOTIFIER_BANTER_AI" in str(excinfo.value)
+
+
+def test_aliases_parse_into_handle_name_pairs():
+    env = MINIMAL | {"NOTIFIER_BANTER_ALIASES": "@nine_iron=Ada Lovelace,@rexmarlow=Rex Marlow"}
+    assert _load(env).aliases == (
+        ("@nine_iron", "Ada Lovelace"),
+        ("@rexmarlow", "Rex Marlow"),
+    )
+
+
+def test_unset_aliases_are_the_empty_tuple_not_an_error():
+    assert _load(MINIMAL).aliases == ()
+
+
+def test_a_malformed_alias_is_skipped_without_refusing_to_start():
+    env = MINIMAL | {"NOTIFIER_BANTER_ALIASES": "@no_separator,@rexmarlow=Rex Marlow"}
+    assert _load(env).aliases == (("@rexmarlow", "Rex Marlow"),)
