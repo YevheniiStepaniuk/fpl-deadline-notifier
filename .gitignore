@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Secrets. The bare `.env` pattern does not cover `.env.bak` or `.env.local`, so an
+# editor backup holding the same bot token could otherwise be committed. The template
+# is the one deliberate exception.
+.env
+.env.*
+!.env.example
+
+# The notifier's own memory: sent-alert keys and the last-good deadline cache. Nothing
+# secret, but machine-local -- committed, it would conflict on every pull and could
+# suppress an alert on another machine by claiming it was already sent.
+data/
+notifier_state.json
+
+# Agent scratch workspace
+.superpowers/
+
+# OS
+.DS_Store

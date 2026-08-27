@@ -1,0 +1,7 @@
+# Whitelist, not a blocklist. The image needs `notifier/` and nothing else, and starting
+# from `*` means a secret cannot reach the build context by being forgotten here: `.env`
+# and `.venv/` are excluded by default rather than by name. Anything a future image
+# genuinely needs has to be added deliberately.
+*
+!notifier/
+notifier/**/__pycache__/

@@ -1,13 +1,13 @@
 # Template, not an installed unit. Copy to /etc/systemd/system/, edit the paths, then:
 # systemctl daemon-reload && systemctl enable --now fpl-notifier
 #
-# Mind the quotes on ExecStart and ReadWritePaths. This project's own directory is
-# "Personal Projects/Fantasy PL" -- two spaces -- and systemd splits both of those
-# settings on whitespace. Unquoted, ExecStart would try to run a binary called
-# ".../Personal" and ReadWritePaths would name two directories that do not exist, so
-# the service would fail to start and, worse, would silently lose write access to
-# data/ under ProtectSystem=strict. WorkingDirectory and EnvironmentFile take a single
-# value each and need no quoting.
+# Keep the quotes on ExecStart and ReadWritePaths. systemd splits both of those
+# settings on whitespace, so a checkout path containing a space -- "Personal Projects",
+# say -- breaks them unquoted: ExecStart would try to run a binary called ".../Personal"
+# and ReadWritePaths would name directories that do not exist, which under
+# ProtectSystem=strict silently removes the write access data/ needs rather than failing
+# loudly. This was a live bug before the quotes went in, not a hypothetical.
+# WorkingDirectory and EnvironmentFile take a single value each and need no quoting.
 [Unit]
 Description=FPL and Draft PL deadline notifier
 # Only orders startup; the service handles a missing network by holding its cache.
@@ -17,9 +17,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=CHANGEME
-WorkingDirectory=/CHANGEME/path/to/Fantasy PL
-EnvironmentFile=/CHANGEME/path/to/Fantasy PL/.env
-ExecStart="/CHANGEME/path/to/Fantasy PL/.venv/bin/python" -m notifier
+WorkingDirectory=/CHANGEME/path/to/fpl-deadline-notifier
+EnvironmentFile=/CHANGEME/path/to/fpl-deadline-notifier/.env
+ExecStart="/CHANGEME/path/to/fpl-deadline-notifier/.venv/bin/python" -m notifier
 Restart=always
 RestartSec=30
 # Restarting freely is safe: sent keys are on disk, so a restart cannot resend, and
@@ -33,7 +33,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths="/CHANGEME/path/to/Fantasy PL/data"
+ReadWritePaths="/CHANGEME/path/to/fpl-deadline-notifier/data"
 
 [Install]
 WantedBy=multi-user.target

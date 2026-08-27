@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fpl-deadline-notifier"
+version = "1.0.0"
+description = "Telegram reminders before Fantasy Premier League and Draft PL deadlines"
+requires-python = ">=3.12"
+# httpx is the only runtime dependency. Everything else the service uses -- zoneinfo,
+# dataclasses, argparse, logging, json -- is in the standard library, which is what
+# keeps the container image small and the thing that has to still work next season
+# almost entirely free of moving parts underneath it.
+dependencies = ["httpx>=0.27"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "respx>=0.21"]
+
+[project.scripts]
+fpl-notifier = "notifier.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["notifier*"]
