@@ -371,7 +371,11 @@ Ten most recent moves survive per league.
 mockable thing either API publishes, and the prompt marks them `REJECTED` explicitly —
 a model given only the move cannot tell it failed.
 
-**Aliases.** `NOTIFIER_BANTER_ALIASES` is comma-separated `@handle=Manager Name`
+**Aliases.** A handle is linked to its league row by a configured name, which comes
+either from `NOTIFIER_ROSTER`'s third field (`handle:fpl_name:team`) or from
+`NOTIFIER_BANTER_ALIASES`; where both name one handle the alias wins, since a variable
+whose only job is to override has to override. `NOTIFIER_BANTER_ALIASES` is
+comma-separated `@handle=Manager Name`
 (equals rather than colon: a colon inside a football-website display name is likelier
 than an equals sign). Linked in two passes — exact on the normalised full name, then a
 single shared word of four letters or more — so a configured "Tomas Harington" still

@@ -33,9 +33,9 @@ ROMAN = Standing(entry=22, manager="Rex Marlow", team_name="Rocket FC", rank=1,
                  gw_points=78, total_points=78)
 
 ROSTER = (
-    RosterMember("@just_bergs", "Liverpool"),
-    RosterMember("@rexmarlow", "Manchester United"),
-    RosterMember("@nobody_here", "Chelsea"),
+    RosterMember("@just_bergs", "", "Liverpool"),
+    RosterMember("@rexmarlow", "", "Manchester United"),
+    RosterMember("@nobody_here", "", "Chelsea"),
 )
 
 CLASSIC = LeagueSnapshot(
@@ -103,7 +103,7 @@ def test_link_roster_ignores_a_too_short_name_inside_a_handle():
     """"Ada" is inside somebody's handle by chance often enough to matter, and the cost
     of a chance match is a personal joke aimed at the wrong mate."""
     short = Standing(entry=55, manager="Ada", team_name="", rank=5)
-    roster = (RosterMember("@adamovich", "Everton"),)
+    roster = (RosterMember("@adamovich", "", "Everton"),)
     assert link_roster((short,), roster) == {}
 
 
@@ -112,7 +112,7 @@ def test_link_roster_matches_a_handle_on_a_surname_alone():
     not inside "tomasharrington" -- but they do share a surname. Observed live: without
     the per-word pass, three of four real mates went unlinked and lost their mention."""
     row = Standing(entry=99, manager="Tomas Harrington", team_name="Harringtons", rank=3)
-    assert link_roster((row,), (RosterMember("@t_harrington", "Arsenal"),))[99].handle == "@t_harrington"
+    assert link_roster((row,), (RosterMember("@t_harrington", "", "Arsenal"),))[99].handle == "@t_harrington"
 
 
 def test_link_roster_leaves_an_unmatched_row_unlinked():
@@ -150,10 +150,35 @@ ALIASES = (
 )
 
 ALIAS_ROSTER = (
-    RosterMember("@nine_iron", "Chelsea"),
-    RosterMember("@just_bergs", "Liverpool"),
-    RosterMember("@t_harrington", "Arsenal"),
+    RosterMember("@nine_iron", "", "Chelsea"),
+    RosterMember("@just_bergs", "", "Liverpool"),
+    RosterMember("@t_harrington", "", "Arsenal"),
 )
+
+
+def test_a_roster_entrys_own_fpl_name_links_it():
+    """The three-field NOTIFIER_ROSTER carries the name itself, so no second variable
+    is needed to tag a handle that shares no letters with it."""
+    row = Standing(entry=77, manager="Ada Lovelace", team_name="Analytical XI", rank=2)
+    roster = (RosterMember("@nine_iron", "Ada Lovelace", "Chelsea"),)
+    assert link_roster((row,), roster)[77].handle == "@nine_iron"
+
+
+def test_a_roster_fpl_name_tolerates_the_same_spelling_drift_an_alias_does():
+    row = Standing(entry=88, manager="Tomas Harrington", team_name="Harringtons", rank=4)
+    roster = (RosterMember("@t_harrington", "Tomas Harington", "Arsenal"),)
+    assert link_roster((row,), roster)[88].handle == "@t_harrington"
+
+
+def test_an_alias_overrides_a_roster_fpl_name_for_the_same_handle():
+    """A variable that exists only to override has to actually override."""
+    table = (
+        Standing(entry=1, manager="Sam Alpha", team_name="A FC", rank=1),
+        Standing(entry=2, manager="Sam Beta", team_name="B FC", rank=2),
+    )
+    roster = (RosterMember("@sam", "Sam Alpha", "Chelsea"),)
+    assert link_roster(table, roster)[1].handle == "@sam"
+    assert link_roster(table, roster, (("@sam", "Sam Beta"),))[2].handle == "@sam"
 
 
 def test_an_alias_links_a_handle_that_shares_no_letters_with_the_name():
@@ -174,7 +199,7 @@ def test_an_exact_alias_beats_a_shared_first_name():
     """Two mates called Sam: the one who spelled the surname the API's way wins, and
     the loose pass cannot steal the row from under them."""
     aliases = (("@sam_a", "Sam Alpha"), ("@sam_b", "Sam Beta"))
-    roster = (RosterMember("@sam_a", "Chelsea"), RosterMember("@sam_b", "Arsenal"))
+    roster = (RosterMember("@sam_a", "", "Chelsea"), RosterMember("@sam_b", "", "Arsenal"))
     table = (
         Standing(entry=1, manager="Sam Beta", team_name="B FC", rank=1),
         Standing(entry=2, manager="Sam Alpha", team_name="A FC", rank=2),
@@ -187,7 +212,7 @@ def test_an_exact_alias_beats_a_shared_first_name():
 def test_an_alias_is_not_overridden_by_a_letter_match_guess():
     """A configured mapping is the operator's answer, not a hint."""
     row = Standing(entry=5, manager="Rex Marlow", team_name="Rocket FC", rank=3)
-    roster = (RosterMember("@rexmarlow", "Man Utd"), RosterMember("@someone", "Spurs"))
+    roster = (RosterMember("@rexmarlow", "", "Man Utd"), RosterMember("@someone", "", "Spurs"))
     linked = link_roster((row,), roster, (("@someone", "Rex Marlow"),))
     assert linked[5].handle == "@someone"
 

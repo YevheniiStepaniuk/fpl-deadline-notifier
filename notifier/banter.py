@@ -16,15 +16,23 @@ from collections.abc import Callable, Sequence
 
 @dataclasses.dataclass(frozen=True)
 class RosterMember:
-    """One mate: the handle a line addresses, and the club that comes with them.
+    """One mate: the handle a line addresses, the name they registered in the FPL
+    league with, and the club that comes with them.
 
-    A pair, not two independent fields picked apart -- `{name}` and `{team}` in a
-    line always come from the *same* member, or "@bob_fpl trusting Liverpool
-    again" replaces "@bob_fpl trusting Manchester United again" and the joke (that
-    it is *his* team) is gone.
+    A pair, not two (now three) independent fields picked apart -- `{name}` and
+    `{team}` in a line always come from the *same* member, or "@bob_fpl trusting
+    Liverpool again" replaces "@bob_fpl trusting Manchester United again" and the
+    joke (that it is *his* team) is gone.
+
+    `fpl_name` is a lookup key for a later feature (matching a manager in the
+    league's standings by this name, to find their handle and eventually their
+    squad) -- not out of scope here, just unused here. None of today's 20 lines
+    render it, and it may be empty: a two-field `NOTIFIER_ROSTER` entry (the form
+    already live in production) carries no fpl_name at all.
     """
 
     handle: str
+    fpl_name: str
     team: str
 
 
@@ -42,6 +50,11 @@ class BanterLine:
     text: str
     needs_name: bool
     needs_team: bool  # implies needs_name; there is no team-only line
+    # Defaulted, unlike the three above: no line in LINES sets this yet (the owner's
+    # 20 are unchanged), so every existing positional BanterLine(...) call below
+    # keeps working unchanged. Implies needs_name, same as needs_team -- there is
+    # no fpl_name-only line either.
+    needs_fpl_name: bool = False
 
 
 # The owner's words, verbatim -- not this module's to reword. `id` numbers match the
@@ -94,14 +107,25 @@ LINE_IDS = frozenset(line.id for line in LINES)
 
 
 def parse_roster(raw: str) -> tuple[RosterMember, ...]:
-    """Parse `NOTIFIER_ROSTER`: comma-separated `handle:team` pairs.
+    """Parse `NOTIFIER_ROSTER`: comma-separated entries, each either the old
+    two-field `handle:team` or the new three-field `handle:fpl_name:team`.
 
     Tolerant on purpose, the same discipline `state.py` applies to a hand-edited
     state file: one malformed entry (no colon, a blank handle or team) is skipped
-    rather than refusing the whole service to start over one mate's typo. Splits on
-    the *first* colon only (`partition`, not `split`), so a team name that happens
-    to contain one -- unlikely, but not this parser's business to assume -- still
-    survives whole in `team`.
+    rather than refusing the whole service to start over one mate's typo. The old
+    two-field form is not a courtesy -- a container in production right now runs
+    with it in its `.env`, and a parser that rejected it would silently degrade
+    banter with nothing in the log to say why.
+
+    Splits on the *first two* colons only (`split(..., maxsplit=2)`), never more:
+    two pieces means `handle:team` (fpl_name defaults to ""), three means
+    `handle:fpl_name:team`, and either way anything past the second colon stays
+    whole in `team`, so a team name containing a colon of its own still survives.
+    The one shape this cannot represent is an fpl_name containing a colon -- with
+    only two splits to work with, a colon typed into fpl_name reads as the
+    boundary before team instead, and the real team ends up glued onto the tail of
+    fpl_name. Not worth a third split for a field that's realistically just a
+    person's name.
     """
     members = []
     for entry in raw.split(","):
@@ -111,14 +135,21 @@ def parse_roster(raw: str) -> tuple[RosterMember, ...]:
             # nothing to add. An unset/empty NOTIFIER_ROSTER must produce (), not a
             # single bogus entry from parsing "".
             continue
-        handle, sep, team = entry.partition(":")
-        if not sep:
+        parts = entry.split(":", 2)
+        if len(parts) == 2:
+            handle, team = parts
+            fpl_name = ""
+        elif len(parts) == 3:
+            handle, fpl_name, team = parts
+        else:
+            # No colon at all: neither the old nor the new form.
             continue
         handle = handle.strip()
+        fpl_name = fpl_name.strip()
         team = team.strip()
         if not handle or not team:
             continue
-        members.append(RosterMember(handle, team))
+        members.append(RosterMember(handle, fpl_name, team))
     return tuple(members)
 
 
@@ -130,9 +161,17 @@ def eligible_lines(roster: Sequence[RosterMember]) -> tuple[BanterLine, ...]:
     that need nothing at all. This is the one thing keeping an unconfigured roster
     from breaking banter outright, so `next_banter` leans on it rather than
     special-casing "no roster" itself.
+
+    Same idea, one field narrower: if nobody in the roster has an fpl_name filled
+    in (the two-field `NOTIFIER_ROSTER` form, still live in production, leaves it
+    ""), a line needing `{fpl_name}` degrades out too. No line in LINES sets
+    needs_fpl_name yet, so this branch is inert today -- it exists so a future
+    line built on {fpl_name} is safe to add without also touching this function.
     """
     if not roster:
         return tuple(line for line in LINES if not line.needs_name)
+    if not any(member.fpl_name for member in roster):
+        return tuple(line for line in LINES if not line.needs_fpl_name)
     return LINES
 
 
@@ -140,18 +179,28 @@ def _pick_target(
     roster: Sequence[RosterMember],
     last_target: str | None,
     rand: Callable[[int], int],
+    *,
+    require_fpl_name: bool = False,
 ) -> RosterMember:
-    candidates = [member for member in roster if member.handle != last_target]
+    # A line needing {fpl_name} must never render a blank one, so it can only
+    # target a member who actually has one -- narrow the pool *before* applying
+    # the no-repeat rule below, so "no one else to switch to" is judged against
+    # the members who qualify at all, not the full roster. `eligible_lines`
+    # guarantees this pool is non-empty whenever such a line is even reachable
+    # here (see its own docstring), so `pool` itself is always safe to fall back
+    # to below.
+    pool = [member for member in roster if member.fpl_name] if require_fpl_name else list(roster)
+    candidates = [member for member in pool if member.handle != last_target]
     if not candidates:
-        # Only reachable with a roster of exactly one, whose sole member *is*
-        # last_target: excluding them would leave nothing to pick from at all. The
-        # consecutive-target rule cannot be honoured here by construction -- there is
-        # no second mate to switch to -- so the sensible compromise is to repeat
-        # them rather than deadlock (no member to return) or raise (this is
-        # decoration, not something worth failing an alert over). A roster of one
-        # is exactly the case this can happen in; two or more always leaves at
-        # least one candidate after excluding a single last_target.
-        candidates = list(roster)
+        # Only reachable with a (possibly fpl_name-narrowed) pool of exactly one,
+        # whose sole member *is* last_target: excluding them would leave nothing to
+        # pick from at all. The consecutive-target rule cannot be honoured here by
+        # construction -- there is no second mate to switch to -- so the sensible
+        # compromise is to repeat them rather than deadlock (no member to return)
+        # or raise (this is decoration, not something worth failing an alert over).
+        # Falling back to `pool`, not the full roster, keeps the fpl_name guarantee
+        # above intact even on this path.
+        candidates = pool
     return candidates[rand(len(candidates))]
 
 
@@ -189,10 +238,10 @@ def next_banter(
         # `_pick_target` with nothing to choose from.
         return line.text, new_used, None
 
-    member = _pick_target(roster, last_target, rand)
-    text = (
-        line.text.format(name=member.handle, team=member.team)
-        if line.needs_team
-        else line.text.format(name=member.handle)
-    )
+    member = _pick_target(roster, last_target, rand, require_fpl_name=line.needs_fpl_name)
+    # Every kwarg is passed unconditionally rather than branching per need (as this
+    # used to, before fpl_name made it a three-way branch): str.format ignores a
+    # kwarg its template doesn't reference, so this is exactly equivalent to the
+    # old name-only/name+team split, just without a branch per new field added.
+    text = line.text.format(name=member.handle, team=member.team, fpl_name=member.fpl_name)
     return text, new_used, member.handle

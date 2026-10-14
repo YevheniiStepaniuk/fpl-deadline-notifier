@@ -1096,7 +1096,7 @@ CLASSIC_STANDINGS = {
 def _ai_cfg(tmp_path, **overrides):
     fields = {
         "banter_enabled": True,
-        "roster": (RosterMember("@just_bergs", "Liverpool"),),
+        "roster": (RosterMember("@just_bergs", "", "Liverpool"),),
         "fpl_league_id": 42,
         "openrouter_key": "sk-test",
         "openrouter_model": "test/model",

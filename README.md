@@ -81,9 +81,10 @@ and the line is written instead from the league's live state: the table, and eve
 manager's latest transfers and waiver claims — including the waivers they *lost*, which
 is the most mockable thing either API publishes. One manager is picked at random, never
 the same one twice running. A roster handle is used to address them when it can be
-matched to their manager or team name (whole-string, then per surname), or when
-`NOTIFIER_BANTER_ALIASES` maps the handle to the name outright — needed for a handle that
-shares no letters with its owner, which is most of them. Unmapped and unmatched, the
+matched to their manager or team name (whole-string, then per surname), or when a configured name
+maps the handle outright — needed for a handle that shares no letters with its owner,
+which is most of them. That name comes from `NOTIFIER_ROSTER`'s third field
+(`handle:fpl_name:team`), or from `NOTIFIER_BANTER_ALIASES`, which overrides it. Unmapped and unmatched, the
 line uses their name off the API and nobody gets a notification.
 
 `NOTIFIER_BANTER_MODEL` picks the model for this and this only, so it can differ from

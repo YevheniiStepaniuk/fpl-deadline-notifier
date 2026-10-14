@@ -182,7 +182,15 @@ def link_roster(
     just addressed by their real name instead of a mention, whereas a bad link aims a
     personal joke at the wrong person and tags them in it.
 
-    `aliases` -- `NOTIFIER_BANTER_ALIASES`, handle to manager name -- is checked first
+    Two sources of a configured name, merged here: a roster entry's own `fpl_name`
+    (the three-field `NOTIFIER_ROSTER` form, `handle:fpl_name:team`) and
+    `NOTIFIER_BANTER_ALIASES`. They do the same job, and `NOTIFIER_ROSTER` is the
+    better place for it -- one entry per mate, no second variable to keep in step. The
+    alias variable wins where both name the same handle, because a variable that exists
+    only to override has to actually override; it also still serves a handle that is in
+    neither roster nor league under its own name.
+
+    The merged mapping -- handle to manager name -- is checked first
     and in two passes, because guessing has a hard floor: no amount of letter-matching
     links "@nine_iron" to "Ada Lovelace". Pass one is exact on the normalised
     full name. Pass two, for rows pass one left alone, accepts a single shared word of
@@ -194,7 +202,8 @@ def link_roster(
     Mapping to entry ids instead was considered and rejected: an id has to be dug out of
     an API response, while the name is on the page the operator is already looking at.
     """
-    by_handle = {handle: name for handle, name in aliases}
+    by_handle = {m.handle: m.fpl_name for m in roster if m.fpl_name}
+    by_handle.update({handle: name for handle, name in aliases})
     linked: dict[int, RosterMember] = {}
 
     for exact in (True, False):
